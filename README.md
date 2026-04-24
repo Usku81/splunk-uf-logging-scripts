@@ -1,17 +1,34 @@
 # Splunk Universal Forwarder — Baseline Logging Prerequisites
 
-Scripts to enable all logging prerequisites on Linux and Windows systems before deploying a Splunk Universal Forwarder. Each script implements the baseline logging configurations recommended by the NSA, ACSC, CIS, MITRE ATT&CK, and other authoritative security frameworks.
+Scripts to enable all logging prerequisites on Linux and Windows systems before deploying a Splunk Universal Forwarder. Each folder also includes a ready-to-deploy `inputs.conf` for the Splunk UF — copy it directly to `$SPLUNK_HOME/etc/system/local/inputs.conf` without renaming. Each script and config implements the baseline logging configurations recommended by the NSA, ACSC, CIS, MITRE ATT&CK, and other authoritative security frameworks.
 
 ---
 
-## Scripts
+## Repository Structure
 
-| Script | Platform | Purpose |
-|--------|----------|---------|
-| `Enable-LinuxLogging-Ubuntu.sh` | Ubuntu 20.04 / 22.04 LTS | Enables auditd, rsyslog, journald, and Sysmon for Linux |
-| `Enable-LinuxLogging-RHEL-CentOS.sh` | RHEL 8/9 / CentOS 8 Stream | Enables auditd, rsyslog, SELinux verification, journald, and Sysmon for Linux |
-| `Enable-WindowsLogging-Workstation.ps1` | Windows Workstation / Member Server | Configures audit policies, PowerShell logging, event log sizes, Sysmon, and firewall logging |
-| `Enable-WindowsLogging-DC.ps1` | Windows Domain Controller | All workstation settings plus Kerberos, DS Access, DCSync detection, DNS debug logging, and ADFS logs |
+```
+splunk-uf-logging-scripts/
+│
+├── ubuntu/
+│   ├── Enable-LinuxLogging-Ubuntu.sh       # Run first — enables auditd, rsyslog, journald, Sysmon
+│   └── inputs.conf                         # Deploy to Splunk UF on Ubuntu hosts
+│
+├── rhel-centos/
+│   ├── Enable-LinuxLogging-RHEL-CentOS.sh  # Run first — enables auditd, rsyslog, SELinux, Sysmon
+│   └── inputs.conf                         # Deploy to Splunk UF on RHEL/CentOS hosts
+│
+├── windows-workstation/
+│   ├── Enable-WindowsLogging-Workstation.ps1  # Run first — audit policy, PowerShell, Sysmon, firewall
+│   └── inputs.conf                            # Deploy to Splunk UF on workstations/member servers
+│
+├── windows-dc/
+│   ├── Enable-WindowsLogging-DC.ps1        # Run first — all workstation settings + DC-specific
+│   └── inputs.conf                         # Deploy to Splunk UF on domain controllers
+│
+└── outputs.conf                            # Shared — deploy to ALL platforms
+```
+
+> **Workflow:** Run the script on the endpoint first to enable OS-level logging, then copy the `inputs.conf` from the matching folder and the shared `outputs.conf` to `$SPLUNK_HOME/etc/system/local/` on the Splunk UF.
 
 ---
 
@@ -43,9 +60,21 @@ Scripts to enable all logging prerequisites on Linux and Windows systems before 
 
 ---
 
+## inputs.conf Index & Sourcetype Reference
+
+| Platform | Index | Key Sourcetypes |
+|----------|-------|----------------|
+| Windows (all) | `windows` | `XmlWinEventLog:Security`, `XmlWinEventLog:Microsoft-Windows-Sysmon/Operational`, etc. |
+| Linux (all) | `linux` | `linux_audit`, `linux_secure`, `syslog`, `dpkg` |
+| Web access logs (nginx/apache) | `linux` | `web_access` |
+| Web error logs (nginx/apache) | `linux` | `web_error` |
+| DNS debug log (DC) | `windows` | `dns` |
+
+---
+
 ## Authoritative Sources & Frameworks
 
-These scripts implement controls drawn from the following recognised security baselines:
+These scripts and configs implement controls drawn from the following recognised security baselines:
 
 | Source | Reference |
 |--------|-----------|
@@ -67,14 +96,16 @@ These scripts implement controls drawn from the following recognised security ba
 
 ## Usage
 
-### Linux
+### Step 1 — Enable OS-level logging
+
+**Linux**
 
 ```bash
 # Ubuntu
-sudo bash Enable-LinuxLogging-Ubuntu.sh
+sudo bash ubuntu/Enable-LinuxLogging-Ubuntu.sh
 
 # RHEL / CentOS
-sudo bash Enable-LinuxLogging-RHEL-CentOS.sh
+sudo bash rhel-centos/Enable-LinuxLogging-RHEL-CentOS.sh
 
 # Options
 --skip-sysmon           Skip Sysmon for Linux installation
@@ -82,14 +113,14 @@ sudo bash Enable-LinuxLogging-RHEL-CentOS.sh
 --splunk-user USER       Splunk UF run-as user (default: splunk)
 ```
 
-### Windows (run as Administrator / Domain Admin on DC)
+**Windows** (run as Administrator; Domain Admin required on DC)
 
 ```powershell
 # Workstation / Member Server
-.\Enable-WindowsLogging-Workstation.ps1
+.\windows-workstation\Enable-WindowsLogging-Workstation.ps1
 
 # Domain Controller
-.\Enable-WindowsLogging-DC.ps1
+.\windows-dc\Enable-WindowsLogging-DC.ps1
 
 # Options
 -SkipSysmon             Skip Sysmon deployment
@@ -98,7 +129,25 @@ sudo bash Enable-LinuxLogging-RHEL-CentOS.sh
 -SysmonConfig <path>    Path to Sysmon XML config (default: .\sysmonconfig-export.xml)
 ```
 
-After running a script, deploy `inputs.conf` and `outputs.conf` to `$SPLUNK_HOME/etc/system/local/` and restart the Splunk Universal Forwarder.
+### Step 2 — Deploy Splunk UF configuration
+
+Copy the `inputs.conf` from the matching platform folder and the shared `outputs.conf` to the Splunk UF local directory, then restart the forwarder:
+
+```bash
+# Linux
+cp ubuntu/inputs.conf $SPLUNK_HOME/etc/system/local/inputs.conf
+cp outputs.conf $SPLUNK_HOME/etc/system/local/outputs.conf
+$SPLUNK_HOME/bin/splunk restart
+```
+
+```powershell
+# Windows
+Copy-Item .\windows-workstation\inputs.conf "$env:SPLUNK_HOME\etc\system\local\inputs.conf"
+Copy-Item .\outputs.conf "$env:SPLUNK_HOME\etc\system\local\outputs.conf"
+Restart-Service SplunkForwarder
+```
+
+> Edit `outputs.conf` to replace `<INDEXER_IP>` with your Splunk indexer address before deploying.
 
 ---
 
