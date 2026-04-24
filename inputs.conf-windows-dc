@@ -1,0 +1,178 @@
+# =============================================================
+# Splunk Universal Forwarder - inputs.conf
+# Target: Windows Domain Controller (AD DS)
+# Reference: NSA EFG, ACSC WEF, Microsoft Appendix L,
+# JSCU-NL logging-essentials, Palantir WEF
+# NOTE: Deploy this file on DCs INSTEAD of the workstation
+#       config — do NOT deploy both.
+# =============================================================
+
+# ── Core Logs (same as workstation) ──────────────────────────
+
+[WinEventLog://Security]
+disabled = false
+renderXml = true
+# DC-specific additions: 4662,4768,4769,4771,4776,4932,4933,
+# 5136-5139,5141 in addition to all workstation Event IDs
+index = windows
+sourcetype = XmlWinEventLog:Security
+
+[WinEventLog://System]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:System
+
+[WinEventLog://Application]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Application
+
+# ── Sysmon ────────────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-Sysmon/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+
+# ── PowerShell ────────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-PowerShell/Operational]
+disabled = false
+renderXml = true
+blacklist = EventCode="4105" OR EventCode="4106"
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+
+[WinEventLog://Windows PowerShell]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Windows-PowerShell
+
+# ── Task Scheduler ────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-TaskScheduler/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-TaskScheduler/Operational
+
+# ── WMI Activity ──────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-WMI-Activity/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-WMI-Activity/Operational
+
+# ── RDP / Terminal Services ───────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-TerminalServices-LocalSessionManager/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-TerminalServices-LocalSessionManager/Operational
+
+[WinEventLog://Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational
+
+# ── Windows Defender ──────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-Windows Defender/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Windows-Defender/Operational
+
+# ── BITS Client ───────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-Bits-Client/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Bits-Client/Operational
+
+# ── Code Integrity ────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-CodeIntegrity/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-CodeIntegrity/Operational
+
+# ── NTLM / SMB ────────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-NTLM/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-NTLM/Operational
+
+[WinEventLog://Microsoft-Windows-SMBClient/Security]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-SMBClient/Security
+
+# ── DC-SPECIFIC: Active Directory Services ────────────────────
+
+[WinEventLog://Directory Service]
+disabled = false
+renderXml = true
+# Event IDs: 1644 (expensive LDAP queries), 2887/2888/2889
+# (LDAP channel binding / signing)
+index = windows
+sourcetype = XmlWinEventLog:Directory-Service
+
+# ── DC-SPECIFIC: DNS Server Debug Log (file monitor) ─────────
+# REQUIRES: Enable-DnsServerDiagnostics (see Prerequisites)
+
+[monitor://C:\Windows\System32\dns\dns.log]
+disabled = false
+sourcetype = dns
+index = windows
+followTail = false
+
+# ── DC-SPECIFIC: ADFS (if role deployed) ─────────────────────
+
+[WinEventLog://AD FS/Admin]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:ADFS-Admin
+
+# ── DC-SPECIFIC: File Replication Service ─────────────────────
+
+[WinEventLog://File Replication Service]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:File-Replication-Service
+
+# ── DC-SPECIFIC: DFS Replication ──────────────────────────────
+
+[WinEventLog://DFS Replication]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:DFS-Replication
+
+# ── AppLocker (DC-local enforcement) ─────────────────────────
+
+[WinEventLog://Microsoft-Windows-AppLocker/EXE and DLL]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-AppLocker/EXE-and-DLL
+
+[WinEventLog://Microsoft-Windows-AppLocker/MSI and Script]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-AppLocker/MSI-and-Script

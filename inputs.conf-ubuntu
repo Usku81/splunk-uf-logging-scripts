@@ -1,0 +1,97 @@
+# =============================================================
+# Splunk Universal Forwarder - inputs.conf
+# Target: Ubuntu 20.04 / 22.04 LTS
+# Reference: Neo23x0 auditd, MITRE ATT&CK, Red Hat Security,
+# ACSC, Splunk TA-linux_auditd
+# =============================================================
+
+# ── auditd - Primary security telemetry source ────────────────
+# REQUIRES: auditd installed + Neo23x0 rules loaded (see §4.1)
+
+[monitor:///var/log/audit/audit.log]
+disabled = false
+sourcetype = linux_audit
+index = linux
+# Use Splunk Add-on for Linux Auditd (TA-linux_auditd) for CIM
+# normalization: https://splunkbase.splunk.com/app/4232
+
+# ── Authentication / PAM / SSH ────────────────────────────────
+# Contains: SSH success/fail, sudo grants, su, PAM events,
+# useradd/groupadd, session open/close
+# Maps to: T1110, T1078, T1548.003, T1136
+
+[monitor:///var/log/auth.log]
+disabled = false
+sourcetype = linux_secure
+index = linux
+
+# ── System / Daemon Messages ──────────────────────────────────
+
+[monitor:///var/log/syslog]
+disabled = false
+sourcetype = syslog
+index = linux
+
+# ── Kernel Log ────────────────────────────────────────────────
+# Contains: module loads/unloads, OOM killer, netfilter
+# Maps to: T1547.006 (Kernel Modules)
+
+[monitor:///var/log/kern.log]
+disabled = false
+sourcetype = linux_messages_syslog
+index = linux
+
+# ── Cron (Scheduled Tasks) ────────────────────────────────────
+# Maps to: T1053.003
+
+[monitor:///var/log/cron.log]
+disabled = false
+sourcetype = syslog
+index = linux
+
+# ── Package Management ────────────────────────────────────────
+# Maps to: T1072, T1195 (software installs)
+
+[monitor:///var/log/dpkg.log]
+disabled = false
+sourcetype = dpkg
+index = linux
+
+[monitor:///var/log/apt/history.log]
+disabled = false
+sourcetype = dpkg
+index = linux
+
+# ── Web Server Logs (if applicable) ──────────────────────────
+# Maps to: T1190 (web exploit), T1133
+
+[monitor:///var/log/nginx/access.log]
+disabled = false
+sourcetype = web_access
+index = linux
+
+[monitor:///var/log/nginx/error.log]
+disabled = false
+sourcetype = web_error
+index = linux
+
+[monitor:///var/log/apache2/access.log]
+disabled = false
+sourcetype = web_access
+index = linux
+
+[monitor:///var/log/apache2/error.log]
+disabled = false
+sourcetype = web_error
+index = linux
+
+# ── Scripted inputs (via Splunk Add-on for Unix and Linux) ────
+# TA-nix provides: CPU, disk, interfaces, lastlog, netstat,
+# passwd, time, top, update, users, version, who
+# Install TA-nix: https://splunkbase.splunk.com/app/833
+
+[script://./bin/lastlog.sh]
+disabled = false
+sourcetype = lastlog
+index = linux
+interval = 3600

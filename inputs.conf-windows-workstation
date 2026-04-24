@@ -1,0 +1,162 @@
+# =============================================================
+# Splunk Universal Forwarder - inputs.conf
+# Target: Windows Workstation / Member Server
+# Reference: NSA EFG, ACSC WEF, Palantir WEF, CIS Benchmarks
+# =============================================================
+
+# ── Core Windows Event Logs ───────────────────────────────────
+
+[WinEventLog://Security]
+disabled = false
+renderXml = true
+# Key Event IDs collected: 4624,4625,4634,4648,4672,4688,4697,
+# 4698-4702,4719,4720,4722,4724,4725,4726,4728,4729,4732,4733,
+# 4740,4756,4757,4776,4778,4779,4964,5140,5145,1102
+# Filtering noisy/low-value events to reduce ingest volume.
+# Remove the blacklist line if your environment needs them all.
+blacklist = EventCode="4634" AND (NOT EventCode IN ("4624","4625","4648","4672","4688","4697","4698","4699","4700","4701","4702","4719","4720","4722","4724","4725","4726","4728","4729","4732","4733","4740","4756","4757","4776","4778","4779","4964","5140","5145","1102","4656","4663","6416"))
+index = windows
+sourcetype = XmlWinEventLog:Security
+
+[WinEventLog://System]
+disabled = false
+renderXml = true
+# Key Event IDs: 7034, 7036, 7040, 7045, 104
+index = windows
+sourcetype = XmlWinEventLog:System
+
+[WinEventLog://Application]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Application
+
+# ── Sysmon (REQUIRES Sysmon installed - see Prerequisites) ────
+
+[WinEventLog://Microsoft-Windows-Sysmon/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 1(ProcessCreate),3(NetworkConn),6(DriverLoad),
+# 7(ImageLoad),8(CreateRemoteThread),10(ProcessAccess),
+# 11(FileCreate),12-14(Registry),17-18(Pipe),19-21(WMI),
+# 22(DNSQuery),25(ProcessTamper)
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Sysmon/Operational
+
+# ── PowerShell Logging (REQUIRES GPO enablement) ──────────────
+
+[WinEventLog://Microsoft-Windows-PowerShell/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 4103 (Module Logging), 4104 (Script Block),
+# 4105/4106 (Start/Stop - enable only if needed, noisy)
+blacklist = EventCode="4105" OR EventCode="4106"
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-PowerShell/Operational
+
+[WinEventLog://Windows PowerShell]
+disabled = false
+renderXml = true
+# Classic PS channel: EventIDs 400, 403, 600, 800
+# Captures HostApplication field (base64 payloads)
+index = windows
+sourcetype = XmlWinEventLog:Windows-PowerShell
+
+# ── Task Scheduler (REQUIRES enablement - see Prerequisites) ──
+
+[WinEventLog://Microsoft-Windows-TaskScheduler/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 106 (task registered), 129 (task launched),
+# 140 (updated), 141 (deleted), 200/201 (action start/end)
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-TaskScheduler/Operational
+
+# ── WMI Activity ──────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-WMI-Activity/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 5857, 5858, 5859, 5860, 5861
+# 5861 = FilterToConsumer binding (highest value - WMI persistence)
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-WMI-Activity/Operational
+
+# ── RDP / Terminal Services ───────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-TerminalServices-LocalSessionManager/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 21,22,23,24,25,39,40 - session start/disconnect
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-TerminalServices-LocalSessionManager/Operational
+
+[WinEventLog://Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational]
+disabled = false
+renderXml = true
+# Event ID 1149 - NLA auth (source IP + username)
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational
+
+# ── Windows Defender ──────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-Windows Defender/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 1006,1007,1116,1117 (detections), 5001 (RT disabled)
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Windows-Defender/Operational
+
+# ── BITS Client ───────────────────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-Bits-Client/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 59,60,61 - LOLBin download via BITSAdmin/certutil
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Bits-Client/Operational
+
+# ── AppLocker (if deployed) ───────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-AppLocker/EXE and DLL]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-AppLocker/EXE-and-DLL
+
+[WinEventLog://Microsoft-Windows-AppLocker/MSI and Script]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-AppLocker/MSI-and-Script
+
+# ── Code Integrity / Driver Signing ──────────────────────────
+
+[WinEventLog://Microsoft-Windows-CodeIntegrity/Operational]
+disabled = false
+renderXml = true
+# Event IDs: 3023, 3033, 3077 - unsigned/blocked driver loads
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-CodeIntegrity/Operational
+
+# ── Removable / USB Devices ───────────────────────────────────
+
+[WinEventLog://Microsoft-Windows-Kernel-PnP/Configuration]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-Kernel-PnP/Configuration
+
+# ── NTLM / SMB (lateral movement protocol coverage) ──────────
+
+[WinEventLog://Microsoft-Windows-NTLM/Operational]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-NTLM/Operational
+
+[WinEventLog://Microsoft-Windows-SMBClient/Security]
+disabled = false
+renderXml = true
+index = windows
+sourcetype = XmlWinEventLog:Microsoft-Windows-SMBClient/Security

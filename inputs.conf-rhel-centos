@@ -1,0 +1,93 @@
+# =============================================================
+# Splunk Universal Forwarder - inputs.conf
+# Target: RHEL 8/9 / CentOS 8 Stream
+# Reference: Neo23x0 auditd, MITRE ATT&CK, Red Hat Security
+# Guide, ACSC, Splunk TA-linux_auditd
+# NOTE: Primary differences from Ubuntu — /var/log/secure
+#       (not auth.log), /var/log/messages (not syslog),
+#       package manager logs use yum.log or dnf.log.
+# =============================================================
+
+# ── auditd - Primary security telemetry source ────────────────
+# REQUIRES: auditd running + Neo23x0 rules loaded (see §5.1)
+
+[monitor:///var/log/audit/audit.log]
+disabled = false
+sourcetype = linux_audit
+index = linux
+
+# ── Authentication / PAM / SSH ────────────────────────────────
+# RHEL equivalent of Ubuntu's auth.log
+# Contains: SSH success/fail, sudo, su, PAM, useradd, groupadd
+# Maps to: T1110, T1078, T1548.003, T1136
+
+[monitor:///var/log/secure]
+disabled = false
+sourcetype = linux_secure
+index = linux
+
+# ── System / Daemon Messages ──────────────────────────────────
+
+[monitor:///var/log/messages]
+disabled = false
+sourcetype = syslog
+index = linux
+
+# ── Cron ──────────────────────────────────────────────────────
+# Maps to: T1053.003
+
+[monitor:///var/log/cron]
+disabled = false
+sourcetype = syslog
+index = linux
+
+# ── Package Management ────────────────────────────────────────
+# RHEL 8+ uses dnf; older CentOS 7 used yum
+# Maps to: T1072, T1195
+
+[monitor:///var/log/dnf.log]
+disabled = false
+sourcetype = linux_audit
+index = linux
+
+[monitor:///var/log/dnf.rpm.log]
+disabled = false
+sourcetype = linux_audit
+index = linux
+
+# For CentOS 7 / RHEL 7 (yum):
+[monitor:///var/log/yum.log]
+disabled = false
+sourcetype = linux_audit
+index = linux
+
+# ── Web Server Logs (if applicable) ──────────────────────────
+# Maps to: T1190 (web exploit), T1133
+
+[monitor:///var/log/httpd/access_log]
+disabled = false
+sourcetype = web_access
+index = linux
+
+[monitor:///var/log/httpd/error_log]
+disabled = false
+sourcetype = web_error
+index = linux
+
+[monitor:///var/log/nginx/access.log]
+disabled = false
+sourcetype = web_access
+index = linux
+
+[monitor:///var/log/nginx/error.log]
+disabled = false
+sourcetype = web_error
+index = linux
+
+# ── Scripted inputs (Splunk Add-on for Unix and Linux) ────────
+
+[script://./bin/lastlog.sh]
+disabled = false
+sourcetype = lastlog
+index = linux
+interval = 3600
