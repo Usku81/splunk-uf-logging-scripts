@@ -331,7 +331,11 @@ Set-AuditPolicy "Account Management" "Other Account Management Events" "Success"
 
 # Detailed Tracking
 Set-AuditPolicy "Detailed Tracking" "Process Creation" "Success"
-Set-AuditPolicy "Detailed Tracking" "Process Termination" "Success"
+# Process Termination (4689) fires 1:1 with 4688 for ~80 MB/day of Security
+# log and is not forwarded; Sysmon EID 5 (ProcessTerminate) covers it. Set
+# explicitly to "No Auditing" rather than just omitting the line - omitting
+# leaves it enabled on hosts where an earlier run or a baseline turned it on.
+Set-AuditPolicy "Detailed Tracking" "Process Termination" "No Auditing"
 Set-AuditPolicy "Detailed Tracking" "Plug and Play Events" "Success"
 Set-AuditPolicy "Detailed Tracking" "RPC Events" "Success"
 
@@ -355,12 +359,17 @@ Set-AuditPolicy "Policy Change" "MPSSVC Rule-Level Policy Change" "Success"
 Set-AuditPolicy "Policy Change" "Other Policy Change Events" "Failure"
 
 # Privilege Use
-Set-AuditPolicy "Privilege Use" "Sensitive Privilege Use" "Success and Failure"
+# Failure-only: successful 4674 is ~58 MB/day of noise and is not forwarded.
+# Sysmon EID 10 (ProcessAccess) is the stronger credential-dumping signal.
+Set-AuditPolicy "Privilege Use" "Sensitive Privilege Use" "Failure"
 
 # System
 Set-AuditPolicy "System" "Security State Change" "Success"
 Set-AuditPolicy "System" "Security System Extension" "Success"
-Set-AuditPolicy "System" "System Integrity" "Success and Failure"
+# Failure-only: successful 5061 (crypto operation) is ~74 MB/day and is not
+# forwarded. Failures retain the high-value signals: 5038 (image hash invalid),
+# 5056/5057 (crypto self-test failure), 4612 (audit queue exhausted).
+Set-AuditPolicy "System" "System Integrity" "Failure"
 
 Write-Log "Audit policy configuration complete." "OK"
 }
