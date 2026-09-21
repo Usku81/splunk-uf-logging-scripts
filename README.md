@@ -67,8 +67,8 @@ On Linux, Sysmon for Linux is installed automatically by the script unless `--sk
 
 ### Linux (Ubuntu & RHEL/CentOS)
 
-- **auditd** — installs, enables, and deploys the [Neo23x0 best-practice ruleset](https://github.com/Neo23x0/auditd), tuned with `ENRICHED` log format and log rotation
-- **rsyslog** — verifies auth logging (`/var/log/auth.log` on Ubuntu, `/var/log/secure` on RHEL/CentOS), syslog, and cron logging
+- **auditd** — installs, enables, and deploys the [Neo23x0 best-practice ruleset](https://github.com/Neo23x0/auditd), tuned with `RAW` log format, log rotation, and [volume tuning](#audit-volume-tuning)
+- **rsyslog** — verifies auth logging (`/var/log/auth.log` on Ubuntu, `/var/log/secure` on RHEL/CentOS), syslog, and cron routing. On Ubuntu it retires the duplicate `cron.log` it used to create; on RHEL `/var/log/cron` is the only copy and is left alone.
 - **journald** — configures persistent storage to survive reboots
 - **SELinux** (RHEL/CentOS) — verifies Enforcing mode for AVC denial logging
 - **Sysmon for Linux** (optional) — Microsoft MSTIC-based process, network, and file event collection
@@ -107,6 +107,7 @@ sudo bash rhel-centos/Enable-LinuxLogging-RHEL-CentOS.sh
 # Options
 --skip-sysmon           Skip Sysmon for Linux installation
 --skip-auditd-rules     Use existing auditd rules (skip Neo23x0 download)
+--skip-volume-tuning    Keep the stock Neo23x0 ruleset verbatim
 --splunk-user USER      Splunk UF run-as user (default: splunk)
 ```
 
@@ -246,6 +247,263 @@ Not all log sources cost the same. If you are deploying to resource-constrained 
 
 **Splunk UF baseline:** typically 100–200 MB RSS. Spikes to 300–500 MB when the indexer is unreachable and the queue is flushing — this is the most common cause of unexpected RAM alerts.
 
+The table above ranks sources by *CPU and RAM*. Ranking them by *volume* usually
+produces a different and more surprising order — see
+[Audit Volume Tuning](#audit-volume-tuning) for how to measure it on your own
+hosts rather than guessing.
+
+---
+
+## What to keep and what to cut
+
+> Applies to the **Ubuntu** and **RHEL/CentOS** scripts and their `inputs.conf`.
+> The Windows configs have not been through this curation pass yet.
+>
+> The ruleset curation is identical on both — auditd rules are OS-agnostic. The
+> **input** curation is deliberately not: see *Cut at the input layer* below,
+> where Ubuntu and RHEL reach opposite conclusions for good reason.
+
+The decision rule is **signal per byte**, not signal alone. A rule that is
+occasionally useful but fires constantly costs more than it returns, because it
+buries the events you care about and pushes the kernel audit backlog toward
+dropping them. Everything below was measured on a reference endpoint against
+server-like activity, with desktop and interactive-session noise excluded.
+
+### The one that dominates: `process_creation`
+
+**71% of all server-like audit bytes**, at ~1.4 KB per event. It is also the
+single most valuable rule you have — nearly every intrusion involves executing
+something. **Keep it, system-wide, and pay for it.**
+
+The common advice is to scope `execve` to `-F auid>=1000`. **Do not.** A process
+spawned by a network service has `auid=unset`, not a user ID — so a web shell
+running as `www-data`, a compromised systemd unit, or anything launched by a
+daemon executes **completely unlogged**. That single flag turns your best
+detection source into one that misses the attacks it exists to catch. Cut
+elsewhere.
+
+### Cut — low signal per byte
+
+| Rule key | Measured | Why it goes |
+|---|---:|---|
+| `network_socket_created` | 3.8% | `socket(AF_INET/AF_INET6)` fires on every DNS lookup and HTTP client call. A socket with no `connect()` carries no signal, and `connect()` is separately covered for IPv4 (`a2=16`) and IPv6 (`a2=28`) — that is where the C2 and lateral-movement evidence actually is. |
+| `file_access` | 1.4% | `open()` → `EACCES`/`EPERM`. Failed opens by unprivileged users, overwhelmingly benign, and it spikes hard whenever a service is missing a permission. |
+| `file_creation` | <0.2% | Same `EACCES`/`EPERM` pattern for create-type calls. |
+| `file_modification` | <0.2% | Same pattern for `rename`/`truncate`/`chmod`. |
+
+The last three look cheap in a quiet window. They are cut because of their
+behaviour **under load** — a permissions problem on a busy service turns any of
+them into the top talker on the host.
+
+### Narrow — right intent, wrong scope
+
+| Rule key | Was | Now | Why |
+|---|---|---|---|
+| `perm_mod` | system-wide | 8 paths (`/etc`, `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin`, `/usr/local/{bin,sbin}`, `/boot`) | System-wide it fires on every package install and every recursive `chown`. A permission change matters where it grants privilege or backdoors a binary. `/opt` is deliberately excluded — agent software recursively chowns itself on restart. |
+| `delete` | system-wide, 4.1% | 8 paths (above, plus `/var/log`, `/var/spool/cron`) | Deletion matters as anti-forensics (T1070) and persistence tampering, not as a record of users tidying their own files. |
+
+### Keep — these are the point of the exercise
+
+All low volume, all high value. `process_creation`, `anon_file_create`
+(`memfd_create`, fileless execution — T1620), `raw_network_socket_created`
+(AF_PACKET raw sockets — T1040 sniffing), `mount` (T1611 container escape),
+`namespaces`, `network_connect_4`, `specialfiles` (`mknod`), `power_abuse`
+(root touching another user's home), plus every `-w` watch on `/etc/passwd`,
+`/etc/shadow`, `/etc/sudoers`, cron directories, systemd units, shell profiles,
+audit config, and module load/unload.
+
+Watches only fire on actual access, so they cost essentially nothing until they
+matter. Never cut these to save volume — there is no volume there to save.
+
+### Cut at the input layer: duplicated files (Ubuntu only)
+
+**This cut applies to Ubuntu and must not be copied to RHEL.** Ubuntu's rsyslog
+routes kernel and cron messages into **both** their own file and
+`/var/log/syslog`:
+
+```
+*.*;auth,authpriv.none      -/var/log/syslog     # includes kern.* and cron.*
+kern.*                      -/var/log/kern.log   # the same lines again
+cron.*                      -/var/log/cron.log   # the same lines again
+```
+
+Measured on a reference host: **20/20 `kern.log` lines and 17/17 `cron.log`
+lines were already present verbatim in `syslog`.** Collecting all three indexes
+those events twice. Both dedicated monitors are therefore `disabled = true` in
+`ubuntu/inputs.conf`, and the script no longer creates `/etc/rsyslog.d/51-cron.conf`.
+
+`auth.log` is the exception and must be collected separately — rsyslog routes
+auth *away* from syslog (`auth,authpriv.none`), measured 0/20 duplicated.
+
+**If you re-enable either**, exclude that facility from syslog instead so you
+still pay once:
+
+```
+*.*;auth,authpriv.none;kern.none;cron.none  -/var/log/syslog
+```
+
+**Sourcetype impact:** with these disabled, kernel and cron events arrive as
+`sourcetype=syslog` rather than `linux_messages_syslog`. Saved searches and
+dashboards keyed on the old sourcetype need updating — the events are still
+there.
+
+**RHEL reaches the opposite conclusion.** Its default routing already excludes
+cron and authpriv from `messages`, and it has no `kern.log` at all:
+
+```
+*.info;mail.none;authpriv.none;cron.none   /var/log/messages
+authpriv.*                                 /var/log/secure
+cron.*                                     /var/log/cron
+```
+
+So `/var/log/cron` and `/var/log/secure` are the **only** copy of those events.
+Both stay enabled in `rhel-centos/inputs.conf`. Disabling them to match the
+Ubuntu file would lose cron and authentication logging outright.
+
+RHEL got one input fix of its own: `dnf.log`, `dnf.rpm.log` and `yum.log` were
+tagged `sourcetype = linux_audit`, which mixed package-manager output into
+auditd searches and broke CIM normalization. They are now `package`.
+
+### Reproducible across a fleet
+
+The ruleset is **pinned to a commit** (`6111069`, 2026-05-04), not `master`, and
+a vendored copy ships beside the script as a fallback for hosts without outbound
+internet. Rolling 70 hosts out over days while tracking `master` means they
+silently end up on different rules depending on when each one ran, which makes a
+detection gap impossible to reason about afterwards. Bump the pin deliberately,
+re-test, redeploy.
+
+Expect a number of rules to be skipped at load time with
+`Error sending add rule data request (No such file or directory)`. These are
+upstream rules referencing software absent from the host (VMware tools,
+CrowdStrike); `auditctl` validates `-F exe=` and `-F dir=` paths and skips the
+rule. Harmless, but it means the loaded rule count is lower than the file count.
+
+---
+
+## Audit Volume Tuning
+
+The stock Neo23x0 ruleset is written for coverage, not for cost. On a reference
+Ubuntu-family endpoint it produced **~1.08 GB/day of raw audit volume from a
+single, largely idle host** — which is what you pay to index, regardless of how
+well it compresses in transit.
+
+### What the scripts do automatically
+
+| Change | Measured effect | Flag to opt out |
+|---|---|---|
+| `log_format = RAW` instead of `ENRICHED` | **−14.5%** | edit `apply_auditd_conf` |
+| `perm_mod` narrowed from system-wide to 8 security-relevant paths | large, spiky — it fires on every package install and recursive `chown` | `--skip-volume-tuning` |
+| `file_access` (failed `open` → `EACCES`/`EPERM`) disabled | −1.4% steady, higher under load | `--skip-volume-tuning` |
+| Splunk unit's recursive `chown` on every start replaced with a guarded check | ~28% of bytes across a restart-heavy window | n/a — only applies if such a unit exists |
+
+`ENRICHED` appends translated `AUID`/`UID`/`ARCH` fields after a `0x1d`
+separator on every record. TA-linux_auditd resolves those at search time, so on
+a forwarded fleet `RAW` costs you nothing. Keep `ENRICHED` if you rely on local
+`ausearch` forensics on hosts whose `/etc/passwd` may change before the logs are
+read.
+
+The rule edits are written into `/etc/audit/rules.d/audit.rules` between
+`## >>> BEGIN volume-tuning (managed) >>>` markers, and disabled rules are
+commented with `## [volume-tuning disabled]` rather than deleted. Re-running the
+script is idempotent. To revert by hand:
+
+```bash
+sed -i '/^## >>> BEGIN volume-tuning (managed) >>>$/,/^## <<< END volume-tuning (managed) <<<$/d' /etc/audit/rules.d/audit.rules
+sed -i 's|^## \[volume-tuning disabled\] ||' /etc/audit/rules.d/audit.rules
+augenrules --load
+```
+
+### Measuring audit volume
+
+**Tune from measurement, not intuition.** On the reference endpoint the single
+largest source was not a security rule at all — it was a desktop panel widget
+polling `ip addr` once a second, accounting for ~80% of all audit bytes. No
+amount of rule tuning would have found that; byte attribution found it in one
+command.
+
+Attribute whole audit events to the executable that caused them:
+
+```bash
+awk '
+{ n = length($0) + 1
+  if (match($0, /audit\([0-9.]+:[0-9]+\)/)) id = substr($0, RSTART, RLENGTH); else id = "?"
+  bytes[id] += n
+  if ($0 ~ /^type=SYSCALL/) {
+      e = "(none)"
+      if (match($0, / exe="[^"]*"/)) e = substr($0, RSTART+6, RLENGTH-7)
+      ex[id] = e } }
+END { for (i in bytes) { e = (i in ex) ? ex[i] : "(no SYSCALL)"; agg[e] += bytes[i]; tot += bytes[i] }
+      for (e in agg) printf "%12d  %5.1f%%  %s\n", agg[e], agg[e]*100/tot, e }
+' /var/log/audit/audit.log | sort -rn | head -15
+```
+
+Same idea, grouped by the rule key that fired — this tells you which rule to tune:
+
+```bash
+awk '
+{ n = length($0) + 1
+  if (match($0, /audit\([0-9.]+:[0-9]+\)/)) id = substr($0, RSTART, RLENGTH); else id = "?"
+  bytes[id] += n
+  if ($0 ~ /^type=SYSCALL/) {
+      k = "(nokey)"
+      if (match($0, / key="[^"]*"/)) k = substr($0, RSTART+6, RLENGTH-7)
+      ky[id] = k } }
+END { for (i in bytes) { k = (i in ky) ? ky[i] : "(no SYSCALL)"; agg[k] += bytes[i]; tot += bytes[i] }
+      for (k in agg) printf "%12d  %5.1f%%  %s\n", agg[k], agg[k]*100/tot, k }
+' /var/log/audit/audit.log | sort -rn | head -15
+```
+
+Identify a noisy pipeline by decoding `PROCTITLE` (hex-encoded command lines):
+
+```bash
+grep -A6 'exe="/usr/bin/ip"' /var/log/audit/audit.log \
+  | grep '^type=PROCTITLE' | grep -oP 'proctitle=\K[0-9A-F]+' \
+  | sort | uniq -c | sort -rn | head -5 \
+  | while read -r n hex; do printf "%6d  %s\n" "$n" "$(echo "$hex" | xxd -r -p | tr '\0' ' ')"; done
+```
+
+Splunk's own view of what it read and shipped:
+
+```bash
+grep 'group=thruput, name=thruput'  $SPLUNK_HOME/var/log/splunk/metrics.log | tail -5
+grep 'group=tcpout_connections'     $SPLUNK_HOME/var/log/splunk/metrics.log | tail -5
+```
+
+> **Note:** `kbps` in `metrics.log` means **kilo*bytes*** per second, not kilobits.
+> Verify against `total_k_processed` divided by uptime before reporting a number.
+
+### Where filtering can and cannot happen
+
+A Universal Forwarder **cannot** do per-event filtering. `props.conf` /
+`transforms.conf` → `nullQueue` runs in the parsing pipeline, which a UF does
+not execute — it ships pre-cooked blocks. Your options:
+
+| Approach | Saves license | Saves endpoint disk/CPU/network |
+|---|:---:|:---:|
+| Filter on the indexer | yes | **no** |
+| Convert UF → heavy forwarder | yes | no (costs more) |
+| **Tune auditd rules** | yes | **yes** |
+
+This is why all tuning above happens at auditd. The UF's only genuine input-side
+lever is whole-file `blacklist` / `whitelist` in a `[monitor://]` stanza, which
+filters files, not events.
+
+### Suppressing a known-benign noise source
+
+If you cannot remove the noisy process itself, suppression rules go in the
+managed block, **before** the `always,exit` rules — auditd is first-match, and
+anything placed after them is never reached. They also cannot live in a
+separate earlier-sorting file, because the ruleset header's `-D` would wipe them.
+
+```
+-a never,exit -F arch=b64 -S all -F exe=/usr/bin/ip -F auid=1000
+```
+
+Treat this as a last resort. Suppressing by `-F exe=` is a real detection gap:
+anything an attacker can invoke as that path becomes invisible. Fix the noise
+source first.
+
 ---
 
 ## Authoritative Sources & Frameworks
@@ -287,7 +545,7 @@ These scripts and configs implement controls drawn from the following recognised
 
 ## Requirements
 
-- **Linux scripts**: Run as root (`sudo`). Ubuntu 20.04/22.04 LTS or RHEL 8/9 / CentOS 8 Stream.
+- **Linux scripts**: Run as root (`sudo`). Ubuntu 20.04/22.04/24.04 LTS or RHEL 8/9 / CentOS 8 Stream.
 - **Windows scripts**: Run as Administrator. Domain Admin required for the DC script.
 - **Splunk Universal Forwarder**: Installed separately — download from [splunk.com](https://www.splunk.com/en_us/download/universal-forwarder.html).
 - **Sysmon** (optional): See [Before You Begin](#️-before-you-begin).
