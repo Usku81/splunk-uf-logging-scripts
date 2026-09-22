@@ -226,8 +226,11 @@ tune_audit_volume() {
     fi
 
     # Idempotent: drop any previous managed block, re-enable prior disables.
+    # Both markers must be stripped, or a re-run without a fresh download
+    # (--skip-auditd-rules) would prefix already-prefixed lines.
     sed -i "/^${BEG}\$/,/^${END}\$/d" "$RULES"
     sed -i 's|^## \[volume-tuning disabled\] ||' "$RULES"
+    sed -i 's|^## \[volume-tuning absent-path\] ||' "$RULES"
 
     # ── 1. Rule families disabled outright ────────────────────────
     #
@@ -328,10 +331,78 @@ tune_audit_volume() {
         }
         { print }
     ' "$RULES" > "${RULES}.tmp" && mv "${RULES}.tmp" "$RULES"
-    chmod 640 "$RULES"; chown root:root "$RULES"
     rm -f "$BLK"
 
+    # ── 4. Prune rules referencing paths absent on this host ──────
+    #
+    # auditctl validates the path in -F dir=, -F exe= and -w at load time and
+    # refuses the rule with:
+    #     Error sending add rule data request (No such file or directory)
+    #     There was an error in line N of /etc/audit/audit.rules
+    #
+    # The upstream ruleset ships rules for software that is not installed on a
+    # default RHEL host - Filebeat (/etc/filebeat, /usr/share/filebeat),
+    # CrowdStrike Falcon (/etc/crowdstrike, /usr/lib/crowdstrike,
+    # /opt/CrowdStrike, /var/log/crowdstrike and the falcon-sensor binary),
+    # VMware tools (/usr/bin/vmtoolsd) and the LVM lock dir (/var/lock/lvm).
+    # Each produces two error lines on every load and every auditd restart,
+    # which is noise in the logs of all 70 hosts and makes the loaded rule
+    # count disagree with the file for no reason.
+    #
+    # Deliberately generic rather than a denylist of those names: any rule
+    # whose path is missing gets the same treatment, so this keeps working as
+    # upstream adds vendors. It is re-evaluated on every run against a freshly
+    # downloaded ruleset, so installing the software and re-running restores
+    # its rules automatically.
+    #
+    # This costs no detection coverage: auditctl had already REFUSED these
+    # rules, so they were never in the kernel. Pruning only stops the error.
+    #
+    # It does however make a pre-existing upstream gap visible. Watches on
+    # files that do not exist yet - /etc/cron.allow, /etc/cron.deny,
+    # /etc/at.allow, /etc/at.deny - are exactly the ones an attacker might
+    # CREATE to control who may schedule jobs, and auditd cannot watch a path
+    # that is absent. Those events are unmonitored both before and after this
+    # change. If that matters in your environment, create the files empty with
+    # the correct ownership so the watches load, or add a rule covering
+    # creation within /etc rather than the individual filenames.
+    local PRUNED=0 line p paths keep
+    : > "${RULES}.tmp"
+    while IFS= read -r line; do
+        keep=1
+        if [[ "$line" == -a\ * || "$line" == -w\ * ]]; then
+            paths=()
+            # -w <path>  (file/directory watch)
+            [[ "$line" == -w\ * ]] && paths+=("$(printf '%s' "$line" | awk '{print $2}')")
+            # -F dir=<path> and -F exe=<path> (may both appear on one rule)
+            if [[ "$line" == *" -F dir="* ]]; then p=${line#*-F dir=}; paths+=("${p%% *}"); fi
+            if [[ "$line" == *" -F exe="* ]]; then p=${line#*-F exe=}; paths+=("${p%% *}"); fi
+            for p in ${paths+"${paths[@]}"}; do
+                # Only absolute paths; strip any trailing slash before testing.
+                [[ "$p" == /* ]] || continue
+                if [[ ! -e "${p%/}" ]]; then
+                    keep=0
+                    break
+                fi
+            done
+        fi
+        if (( keep )); then
+            printf '%s\n' "$line" >> "${RULES}.tmp"
+        else
+            printf '## [volume-tuning absent-path] %s\n' "$line" >> "${RULES}.tmp"
+            PRUNED=$((PRUNED + 1))
+        fi
+    done < "$RULES"
+    mv "${RULES}.tmp" "$RULES"
+
+    chmod 640 "$RULES"; chown root:root "$RULES"
+
     ok "Volume tuning: cut/narrowed ${n_off} rule(s), added ${N_ADD} scoped rule(s)."
+    if (( PRUNED > 0 )); then
+        ok "  Pruned ${PRUNED} rule(s) referencing paths not present on this host."
+        log "  (Filebeat / CrowdStrike / VMware-tools style rules. Install the"
+        log "   software and re-run to restore them.)"
+    fi
 }
 
 if [[ "$SKIP_VOLUME_TUNING" == "true" ]]; then
