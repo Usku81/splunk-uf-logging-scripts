@@ -42,7 +42,7 @@ set -euo pipefail
 SKIP_SYSMON=false
 SKIP_AUDITD_RULES=false
 SKIP_VOLUME_TUNING=false
-SPLUNK_USER="splunk"
+SPLUNK_USER="splunkfwd"
 LOG_FILE="/var/log/splunk-prereq-rhel-$(date +%Y%m%d_%H%M%S).log"
 # Pinned to a commit, not master. Across a fleet rolled out over days or weeks,
 # tracking master means hosts silently end up on different rulesets depending on
