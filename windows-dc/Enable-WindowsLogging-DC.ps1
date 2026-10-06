@@ -1,575 +1,1159 @@
 #Requires -RunAsAdministrator
+
+#Requires -Version 5.1
 <#
+
 .SYNOPSIS
-    Enable all prerequisite logging for Splunk UF collection on a Windows Domain Controller.
 
+    Logging prerequisites for Splunk UF collection on a Windows Workstation / Member Server,
+
+    with -DryRun, backup and -Rollback.
+ 
 .DESCRIPTION
-    Applies ALL workstation logging prerequisites PLUS DC-specific additions:
-      - Kerberos authentication + service-ticket audit policy (4768, 4769, 4771)
-      - DS Access: Directory Service Changes (5136-5139, 5141)
-      - DS Access: Directory Service Access (4662 - DCSync detection)
-      - DS Access: Directory Service Replication (4932, 4933)
-      - Privilege Use: Sensitive Privilege Use (4673, 4674)
-      - DNS Server debug logging (dns.log)
-      - ADFS operational log enablement (if ADFS role present)
-      - DFS Replication and File Replication Service logs
-      - Directory Service log size increase
 
-    Sources: NSA EFG, ACSC WEF, Microsoft Appendix L, JSCU-NL logging-essentials,
-             Palantir WEF, CIS Benchmarks sec 17.
+    Derived from Usku81/splunk-uf-logging-scripts windows-workstation/Enable-WindowsLogging-Workstation.ps1.
+ 
+    FIXES vs. the original
+
+      1. No backtick line continuations anywhere (all multi-line calls use splatting).
+
+         A backtick followed by a space or a blank line ends the command early. That caused
+
+         "Cannot bind argument to parameter 'Path' because it is an empty string" (STEP 2/4),
+
+         the interactive "Path[0]:" prompt in STEP 9, and "'-All' is not recognized" in STEP 6.
+
+      2. Registry written through the .NET API, so the ModuleNames value literally named "*"
+
+         is never treated as a wildcard.
+
+      3. AppLocker: the AppIDSvc service is protected - Set-Service fails with "Access is denied"
+
+         even as admin, and without an AppLocker policy no 8002-8007 events are produced anyway.
+
+         The script now only enables the channels and reports whether a policy exists.
+
+      4. Sysmon paths resolve next to the script (not the current directory). An existing
+
+         Sysmon is left untouched unless -UpdateSysmonConfig, and then the INSTALLED binary
+
+         is used so binary and driver versions match. sysmon64.exe signature is verified.
+
+      5. Event log sizes only grow - a larger existing log is never shrunk.
+
+      6. Audit policy is ADDITIVE by default (never disables). -EnforceBaseline applies the
+
+         original exact baseline (Process Termination off, Sensitive Privilege Use and
+
+         System Integrity Failure-only) and logs every setting it lowers.
+
+      7. Refuses to run on a Domain Controller (use Enable-WindowsLogging-DC-Safe.ps1).
+ 
+    ADDED
+
+      -DryRun     prints every intended change, changes nothing.
+
+      Backup      auditpol, gpresult, firewall profiles, plus state.json of every value changed.
+
+      -Rollback   reverts exactly what one run changed.
+ 
+.PARAMETER DryRun
+
+    Show what would change. Changes nothing (no backup, no state file).
+
+.PARAMETER Rollback
+
+    Path to a state.json from a previous run on THIS host. Reverts that run and exits.
+
+.PARAMETER EnforceBaseline
+
+    Apply the original exact audit baseline, including disabling flags (noise reduction).
 
 .PARAMETER SkipSysmon
-    Skip Sysmon installation.
 
-.PARAMETER SysmonConfig
-    Path to Sysmon XML config. Defaults to .\sysmonconfig-export.xml
+    Do not install Sysmon.
 
-.PARAMETER SysmonBinary
-    Path to sysmon64.exe. Defaults to .\sysmon64.exe
+.PARAMETER UpdateSysmonConfig
 
-.PARAMETER SkipDNSLogging
-    Skip DNS Server debug logging enablement.
+    If Sysmon is already installed, apply -SysmonConfig to it (not reversible by -Rollback).
 
+.PARAMETER SkipModuleLogging
+
+    Do not enable PowerShell module logging (EID 4103).
+
+.PARAMETER DroppedOnly
+
+    Firewall log: dropped packets only (default logs dropped + allowed, as the original).
+
+.PARAMETER Force
+
+    Allow running on a Domain Controller.
+ 
 .EXAMPLE
-    .\Enable-WindowsLogging-DC.ps1
-    .\Enable-WindowsLogging-DC.ps1 -SkipSysmon -SkipDNSLogging
 
+    .\Enable-WindowsLogging-Workstation-Safe.ps1 -DryRun
+
+    .\Enable-WindowsLogging-Workstation-Safe.ps1
+
+    .\Enable-WindowsLogging-Workstation-Safe.ps1 -DryRun -EnforceBaseline -SkipSysmon
+
+    .\Enable-WindowsLogging-Workstation-Safe.ps1 -Rollback "C:\ProgramData\WinLoggingChange\<run>\state.json"
+ 
 .NOTES
-    Must be run as Domain Admin (or equivalent) on the DC itself.
-    Run on EACH domain controller in the environment.
+
+    Exit codes: 0 = success, 1 = one or more steps failed, 2 = pre-flight refused.
+
+    No reboot required.
+
 #>
 
 [CmdletBinding()]
+
 param(
+
+    [switch]$DryRun,
+
+    [string]$Rollback,
+
+    [switch]$EnforceBaseline,
+
     [switch]$SkipSysmon,
-    [switch]$SkipDNSLogging,
-    [switch]$Force,
-    [string]$SysmonConfig = ".\sysmonconfig-export.xml",
-    [string]$SysmonBinary = ".\sysmon64.exe"
+
+    [switch]$UpdateSysmonConfig,
+
+    [switch]$SkipModuleLogging,
+
+    [switch]$DroppedOnly,
+
+    [string]$SysmonBinary,
+
+    [string]$SysmonConfig,
+
+    [int]$MinFreeSpaceGB = 3,
+
+    [switch]$Force
+
 )
-
+ 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
 
-$LogFile = "$env:SystemRoot\Temp\Enable-WindowsLogging-DC_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$ErrorActionPreference = 'Stop'
+ 
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
+if (-not $SysmonBinary) { $SysmonBinary = Join-Path $ScriptDir 'sysmon64.exe' }
+
+if (-not $SysmonConfig) { $SysmonConfig = Join-Path $ScriptDir 'sysmonconfig-export.xml' }
+ 
+$RunId     = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+$Mode      = if ($Rollback) { 'rollback' } elseif ($DryRun) { 'dryrun' } else { 'apply' }
+
+$WorkDir   = Join-Path $env:ProgramData "WinLoggingChange\${RunId}_$Mode"
+
+New-Item -Path $WorkDir -ItemType Directory -Force | Out-Null
+
+$LogFile   = Join-Path $WorkDir 'run.log'
+
+$StateFile = Join-Path $WorkDir 'state.json'
+ 
+# ════════════════════════════════════════════════════════════════════
+
+# Helpers
+
+# ════════════════════════════════════════════════════════════════════
+ 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $ts   = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$ts] [$Level] $Message"
-    switch ($Level) {
-        "OK"    { Write-Host $line -ForegroundColor Green  }
-        "WARN"  { Write-Host $line -ForegroundColor Yellow }
-        "ERROR" { Write-Host $line -ForegroundColor Red    }
-        default { Write-Host $line }
-    }
+
+    param([string]$Message, [ValidateSet('INFO','OK','WARN','ERROR','PLAN')][string]$Level = 'INFO')
+
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+
+    $color = @{ OK = 'Green'; WARN = 'Yellow'; ERROR = 'Red'; PLAN = 'Cyan'; INFO = 'Gray' }[$Level]
+
+    Write-Host $line -ForegroundColor $color
+
     Add-Content -Path $LogFile -Value $line
-}
 
+}
+ 
 function Write-Section {
+
     param([string]$Title)
-    $line = "=" * 70
-    Write-Host ""; Write-Host $line -ForegroundColor Cyan
-    Write-Host "  $Title" -ForegroundColor Cyan
-    Write-Host $line -ForegroundColor Cyan
-    Add-Content -Path $LogFile -Value "`n$line`n  $Title`n$line"
+
+    $bar = '=' * 70
+
+    Write-Host ''; Write-Host $bar -ForegroundColor Cyan; Write-Host " $Title" -ForegroundColor Cyan; Write-Host $bar -ForegroundColor Cyan
+
+    Add-Content -Path $LogFile -Value "`n$bar`n $Title`n$bar"
+
 }
-
+ 
 function Invoke-Native {
-    <#
-        Runs a native executable and returns its exit code plus output.
 
-        Windows PowerShell 5.1 wraps every stderr line from a native command in
-        a NativeCommandError ErrorRecord. Under $ErrorActionPreference = "Stop"
-        that becomes a TERMINATING error, so a tool that merely prints a banner
-        to stderr (Sysmon and most Sysinternals tools) aborts the whole script
-        even when it exited 0. Isolate the call, judge success by the exit code.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [string[]]$Arguments = @()
-    )
+    # Judge success by exit code, not stderr (PS 5.1 wraps stderr in NativeCommandError).
 
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
+
+    $prev = $ErrorActionPreference
+
+    $ErrorActionPreference = 'Continue'
 
     try {
-        # Stderr lines arrive as ErrorRecords - take the message, or they render
-        # as "System.Management.Automation.RemoteException". Strip NUL bytes too:
-        # Sysinternals tools write UTF-16, which PS 5.1 decodes as ANSI, so every
-        # character arrives NUL-separated.
-        $out = & $FilePath @Arguments 2>&1 |
-                   ForEach-Object {
-                       $text = if ($_ -is [System.Management.Automation.ErrorRecord]) {
-                           $_.Exception.Message
-                       } else {
-                           "$_"
-                       }
 
-                       $text.Replace([string][char]0, '').Trim()
-                   } |
-                   Where-Object { $_ }
+        $out = & $FilePath @Arguments 2>&1 | ForEach-Object {
+
+            $t = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+
+            $t.Replace([string][char]0, '').Trim()
+
+        } | Where-Object { $_ }
 
         [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($out) }
-    }
-    finally {
-        $ErrorActionPreference = $prevEAP
-    }
-}
 
+    } finally { $ErrorActionPreference = $prev }
+
+}
+ 
 $script:FailedSteps = @()
 
 function Invoke-Step {
-    <#
-        Runs one step in isolation. A failure is logged and recorded, then the
-        script continues. A DC hardening script must never leave a controller
-        half-configured because one step failed on one OS build.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Title,
-        [Parameter(Mandatory)][scriptblock]$Body
-    )
+
+    param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][scriptblock]$Body)
 
     Write-Section $Title
 
-    try {
-        & $Body
-    }
+    try { & $Body }
+
     catch {
+
         $script:FailedSteps += $Title
-        Write-Log "STEP FAILED: $Title" "ERROR"
-        Write-Log "  $($_.Exception.Message)" "ERROR"
-        Write-Log "  Continuing with remaining steps." "WARN"
+
+        Write-Log "STEP FAILED: $Title" 'ERROR'
+
+        Write-Log "  $($_.Exception.Message)" 'ERROR'
+
+        Write-Log '  Continuing with remaining steps.' 'WARN'
+
     }
+
+}
+ 
+# ── State (everything needed to roll back) ──────────────────────────
+
+$script:State = [ordered]@{
+
+    Version             = 1
+
+    Computer            = $env:COMPUTERNAME
+
+    StartedUtc          = (Get-Date).ToUniversalTime().ToString('o')
+
+    AuditBackup         = $null
+
+    Registry            = @()
+
+    EventLogs           = @()
+
+    Firewall            = @()
+
+    SysmonInstalled     = $false
+
+    SysmonConfigUpdated = $false
+
 }
 
-function Set-AuditPolicy {
-    param([string]$Category, [string]$Subcategory, [string]$Setting)
-    $success = if ($Setting -match "Success") { "enable" } else { "disable" }
-    $failure = if ($Setting -match "Failure") { "enable" } else { "disable" }
-    $r = Invoke-Native "auditpol.exe" @(
-        "/set"
-        "/subcategory:$Subcategory"
-        "/success:$success"
-        "/failure:$failure"
+function Save-State {
+
+    if ($DryRun) { return }
+
+    $script:State | ConvertTo-Json -Depth 6 | Set-Content -Path $StateFile -Encoding UTF8
+
+}
+ 
+# ── Registry (.NET API: no wildcard handling of a value named "*") ──
+
+function Get-RegState {
+
+    param([string]$SubKey, [string]$Name)
+
+    $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($SubKey)
+
+    if ($null -eq $k) { return [pscustomobject]@{ KeyExisted = $false; ValueExisted = $false; Value = $null; Kind = $null } }
+
+    try {
+
+        $exists = @($k.GetValueNames()) -contains $Name
+
+        [pscustomobject]@{
+
+            KeyExisted   = $true
+
+            ValueExisted = $exists
+
+            Value        = $(if ($exists) { $k.GetValue($Name) } else { $null })
+
+            Kind         = $(if ($exists) { $k.GetValueKind($Name).ToString() } else { $null })
+
+        }
+
+    } finally { $k.Close() }
+
+}
+ 
+function Write-RegValue {
+
+    param([string]$SubKey, [string]$Name, $Value, [string]$Kind)
+
+    $k = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($SubKey)
+
+    try {
+
+        $typed = if ($Kind -eq 'DWord') { [int]$Value } else { [string]$Value }
+
+        $k.SetValue($Name, $typed, [Microsoft.Win32.RegistryValueKind]$Kind)
+
+    } finally { $k.Close() }
+
+}
+ 
+function Set-RegTracked {
+
+    param([string]$SubKey, [string]$Name, $Value, [ValidateSet('DWord','String')][string]$Kind = 'DWord')
+
+    $display = "HKLM\$SubKey\$Name"
+
+    $cur = Get-RegState $SubKey $Name
+
+    if ($cur.ValueExisted -and "$($cur.Value)" -eq "$Value") { Write-Log "  Unchanged: $display = $Value"; return }
+
+    $prevText = if ($cur.ValueExisted) { "$($cur.Value)" } else { '<not set>' }
+
+    if ($DryRun) { Write-Log "  [DRYRUN] $display : $prevText -> $Value" 'PLAN'; return }
+ 
+    $script:State.Registry += [pscustomobject]@{
+
+        SubKey = $SubKey; Name = $Name; KeyExisted = $cur.KeyExisted
+
+        ValueExisted = $cur.ValueExisted; PreviousValue = $cur.Value; PreviousKind = $cur.Kind
+
+    }
+
+    Save-State
+
+    Write-RegValue $SubKey $Name $Value $Kind
+
+    Write-Log "  Set: $display : $prevText -> $Value" 'OK'
+
+}
+ 
+# ── Audit policy ────────────────────────────────────────────────────
+
+function Get-AuditInclusion {
+
+    param([string]$Subcategory)
+
+    $r = Invoke-Native 'auditpol.exe' @('/get', "/subcategory:$Subcategory", '/r')
+
+    if ($r.ExitCode -ne 0) { throw "auditpol /get failed for '$Subcategory' (exit $($r.ExitCode)): $($r.Output -join ' ')" }
+
+    $row = @($r.Output | ConvertFrom-Csv) | Select-Object -First 1
+
+    if ($null -eq $row) { throw "auditpol returned no data for '$Subcategory'" }
+
+    return [string]$row.'Inclusion Setting'
+
+}
+ 
+function Format-Audit {
+
+    param([bool]$S, [bool]$F)
+
+    if ($S -and $F) { 'Success and Failure' } elseif ($S) { 'Success' } elseif ($F) { 'Failure' } else { 'No Auditing' }
+
+}
+ 
+function Set-AuditTracked {
+
+    # Default: additive (only enables). -EnforceBaseline: exact target, may disable.
+
+    param([string]$Subcategory, [ValidateSet('Success','Failure','SuccessAndFailure','None')][string]$Want)
+
+    try { $cur = Get-AuditInclusion $Subcategory }
+
+    catch { Write-Log "  $($_.Exception.Message)" 'ERROR'; return }
+ 
+    $hasS  = $cur -match 'Success'
+
+    $hasF  = $cur -match 'Failure'
+
+    $wantS = $Want -in 'Success', 'SuccessAndFailure'
+
+    $wantF = $Want -in 'Failure', 'SuccessAndFailure'
+ 
+    if ($EnforceBaseline) { $newS = $wantS; $newF = $wantF }
+
+    else                  { $newS = $hasS -or $wantS; $newF = $hasF -or $wantF }
+ 
+    if ($newS -eq $hasS -and $newF -eq $hasF) { Write-Log "  Unchanged: $Subcategory = $cur"; return }
+ 
+    $lowers = @()
+
+    if ($hasS -and -not $newS) { $lowers += 'Success' }
+
+    if ($hasF -and -not $newF) { $lowers += 'Failure' }
+
+    $newText = Format-Audit $newS $newF
+
+    $note    = if ($lowers) { "  (DISABLES $($lowers -join '+'))" } else { '' }
+
+    $level   = if ($lowers) { 'WARN' } else { 'OK' }
+ 
+    if ($DryRun) { Write-Log "  [DRYRUN] $Subcategory : '$cur' -> '$newText'$note" 'PLAN'; return }
+ 
+    $a = @('/set', "/subcategory:$Subcategory",
+
+           "/success:$(if ($newS) { 'enable' } else { 'disable' })",
+
+           "/failure:$(if ($newF) { 'enable' } else { 'disable' })")
+
+    $r = Invoke-Native 'auditpol.exe' $a
+
+    if ($r.ExitCode -eq 0) { Write-Log "  Audit: $Subcategory : '$cur' -> '$newText'$note" $level }
+
+    else { Write-Log "  FAILED: $Subcategory (exit $($r.ExitCode)) $($r.Output -join ' ')" 'ERROR' }
+
+}
+ 
+# ── Event logs (enable / grow only) ─────────────────────────────────
+
+function Set-EventLogTracked {
+
+    param([string]$LogName, [long]$MinBytes, [switch]$Enable)
+
+    try { $cfg = Get-WinEvent -ListLog $LogName -ErrorAction Stop }
+
+    catch { Write-Log "  Channel not present on this host: '$LogName' - skipped" 'WARN'; return }
+ 
+    $curBytes   = [long]$cfg.MaximumSizeInBytes
+
+    $needSize   = $curBytes -lt $MinBytes
+
+    $needEnable = $Enable -and -not $cfg.IsEnabled
+
+    $curMB = [math]::Round($curBytes / 1MB); $minMB = [math]::Round($MinBytes / 1MB)
+ 
+    if (-not ($needSize -or $needEnable)) {
+
+        Write-Log "  Unchanged: '$LogName' ($curMB MB, enabled=$($cfg.IsEnabled))"; return
+
+    }
+
+    $a = @('sl', $LogName); $desc = @()
+
+    if ($needEnable) { $a += '/e:true'; $desc += 'enable' }
+
+    if ($needSize)   { $a += "/ms:$MinBytes"; $desc += "size $curMB MB -> $minMB MB" }
+ 
+    if ($DryRun) { Write-Log "  [DRYRUN] '$LogName' : $($desc -join ', ')" 'PLAN'; return }
+ 
+    $script:State.EventLogs += [pscustomobject]@{
+
+        LogName = $LogName; PreviousBytes = $curBytes; PreviousEnabled = [bool]$cfg.IsEnabled
+
+        ChangedSize = $needSize; ChangedEnabled = $needEnable
+
+    }
+
+    Save-State
+
+    $r = Invoke-Native 'wevtutil.exe' $a
+
+    if ($r.ExitCode -ne 0) { Write-Log "  Failed '$LogName' (exit $($r.ExitCode)): $($r.Output -join ' ')" 'WARN'; return }
+ 
+    $eff = [long](Get-WinEvent -ListLog $LogName).MaximumSizeInBytes
+
+    if ($needSize -and $eff -lt $MinBytes) {
+
+        Write-Log "  '$LogName' size NOT applied (effective $([math]::Round($eff/1MB)) MB) - overridden by GPO (Event Log Service policy)." 'WARN'
+
+    } else {
+
+        Write-Log "  '$LogName' : $($desc -join ', ')" 'OK'
+
+    }
+
+}
+ 
+# ════════════════════════════════════════════════════════════════════
+
+# ROLLBACK MODE
+
+# ════════════════════════════════════════════════════════════════════
+
+function Invoke-Rollback {
+
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) { throw "State file not found: $Path" }
+
+    $s = Get-Content -Path $Path -Raw | ConvertFrom-Json
+
+    if ($s.Computer -ne $env:COMPUTERNAME) { throw "State file belongs to '$($s.Computer)', not '$env:COMPUTERNAME'. Refusing." }
+
+    Write-Log "Rolling back run started $($s.StartedUtc) on $($s.Computer)"
+ 
+    Invoke-Step 'ROLLBACK: Sysmon' {
+
+        if ($s.SysmonInstalled) {
+
+            $exe = Join-Path $env:SystemRoot 'Sysmon64.exe'
+
+            if (Test-Path $exe) {
+
+                $r = Invoke-Native $exe @('-u')
+
+                Write-Log "  Sysmon uninstall exit $($r.ExitCode)" $(if ($r.ExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+            } else { Write-Log "  $exe not found - uninstall Sysmon manually" 'WARN' }
+
+        } elseif ($s.SysmonConfigUpdated) {
+
+            Write-Log '  Sysmon config was updated by that run and cannot be restored automatically.' 'WARN'
+
+            Write-Log '  Re-apply your previous config XML with: Sysmon64.exe -c <previous.xml>' 'WARN'
+
+        } else { Write-Log '  Sysmon was not changed by that run - nothing to do' }
+
+    }
+ 
+    Invoke-Step 'ROLLBACK: Firewall logging' {
+
+        foreach ($f in @($s.Firewall)) {
+
+            $fw = @{
+
+                Profile             = $f.Profile
+
+                PolicyStore         = 'PersistentStore'
+
+                LogBlocked          = $f.LogBlocked
+
+                LogAllowed          = $f.LogAllowed
+
+                LogMaxSizeKilobytes = [uint64]$f.LogMaxSizeKilobytes
+
+                ErrorAction         = 'Stop'
+
+            }
+
+            Set-NetFirewallProfile @fw
+
+            Write-Log "  $($f.Profile): LogBlocked=$($f.LogBlocked) LogAllowed=$($f.LogAllowed) Size=$($f.LogMaxSizeKilobytes)KB" 'OK'
+
+        }
+
+    }
+ 
+    Invoke-Step 'ROLLBACK: Event logs' {
+
+        foreach ($e in @($s.EventLogs)) {
+
+            $a = @('sl', $e.LogName)
+
+            if ($e.ChangedSize)    { $a += "/ms:$($e.PreviousBytes)" }
+
+            if ($e.ChangedEnabled) { $a += '/e:false' }
+
+            $r = Invoke-Native 'wevtutil.exe' $a
+
+            if ($r.ExitCode -eq 0) { Write-Log "  '$($e.LogName)' restored" 'OK' }
+
+            else { Write-Log "  '$($e.LogName)' not restored (exit $($r.ExitCode)) - shrinking may need the log cleared/archived first: $($r.Output -join ' ')" 'WARN' }
+
+        }
+
+    }
+ 
+    Invoke-Step 'ROLLBACK: Registry' {
+
+        $regs = @($s.Registry); [array]::Reverse($regs)
+
+        foreach ($r in $regs) {
+
+            if ($r.ValueExisted) {
+
+                Write-RegValue $r.SubKey $r.Name $r.PreviousValue $r.PreviousKind
+
+                Write-Log "  Restored HKLM\$($r.SubKey)\$($r.Name) = $($r.PreviousValue)" 'OK'
+
+            } else {
+
+                $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($r.SubKey, $true)
+
+                $empty = $false
+
+                if ($k) {
+
+                    try { $k.DeleteValue($r.Name, $false); $empty = ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0) }
+
+                    finally { $k.Close() }
+
+                }
+
+                if (-not $r.KeyExisted -and $empty) { [Microsoft.Win32.Registry]::LocalMachine.DeleteSubKey($r.SubKey, $false) }
+
+                Write-Log "  Removed HKLM\$($r.SubKey)\$($r.Name) (did not exist before)" 'OK'
+
+            }
+
+        }
+
+    }
+ 
+    Invoke-Step 'ROLLBACK: Audit policy' {
+
+        if ($s.AuditBackup -and (Test-Path $s.AuditBackup)) {
+
+            $r = Invoke-Native 'auditpol.exe' @('/restore', "/file:$($s.AuditBackup)")
+
+            Write-Log "  auditpol /restore exit $($r.ExitCode)" $(if ($r.ExitCode -eq 0) { 'OK' } else { 'ERROR' })
+
+        } else { Write-Log "  Audit backup not found: $($s.AuditBackup)" 'ERROR'; throw 'Audit backup missing' }
+
+    }
+
+}
+ 
+# ════════════════════════════════════════════════════════════════════
+
+# START
+
+# ════════════════════════════════════════════════════════════════════
+
+Write-Host ''
+
+Write-Host " Splunk UF Prerequisites - Workstation / Member Server  [mode: $Mode]" -ForegroundColor White
+
+Write-Host " Working folder: $WorkDir" -ForegroundColor Gray
+ 
+if (-not [Environment]::Is64BitProcess) {
+
+    Write-Log 'Run from 64-bit PowerShell (registry redirection would otherwise apply).' 'ERROR'; exit 2
+
+}
+ 
+if ($Rollback) {
+
+    Invoke-Rollback -Path $Rollback
+
+    if ($script:FailedSteps.Count) { Write-Log "Rollback finished with $($script:FailedSteps.Count) failed step(s)." 'ERROR'; exit 1 }
+
+    Write-Log 'Rollback complete. Run gpupdate /force to re-apply any GPO-managed values.' 'OK'; exit 0
+
+}
+ 
+# ── PRE-FLIGHT ──────────────────────────────────────────────────────
+
+Write-Section 'PRE-FLIGHT CHECKS'
+ 
+$role = (Get-CimInstance Win32_ComputerSystem).DomainRole
+
+$roleName = @{ 0 = 'Standalone workstation'; 1 = 'Member workstation'; 2 = 'Standalone server'; 3 = 'Member server'; 4 = 'Backup DC'; 5 = 'Primary DC' }[[int]$role]
+
+if ($role -ge 4) {
+
+    if ($Force) { Write-Log "This is a Domain Controller ($roleName) - continuing because -Force was given." 'WARN' }
+
+    else { Write-Log "This is a Domain Controller ($roleName). Use Enable-WindowsLogging-DC-Safe.ps1, or -Force." 'ERROR'; exit 2 }
+
+} else { Write-Log "Host role: $roleName" 'OK' }
+ 
+$sysDrive = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'"
+
+$freeGB = [math]::Round($sysDrive.FreeSpace / 1GB, 1)
+
+if ($freeGB -lt $MinFreeSpaceGB) { Write-Log "Only $freeGB GB free on $env:SystemDrive (need $MinFreeSpaceGB GB). Refusing." 'ERROR'; exit 2 }
+
+Write-Log "Free space on $env:SystemDrive : $freeGB GB" 'OK'
+ 
+Write-Log "Audit mode: $(if ($EnforceBaseline) { 'ENFORCE baseline (may disable existing flags)' } else { 'ADDITIVE (never disables)' })" $(if ($EnforceBaseline) { 'WARN' } else { 'OK' })
+ 
+$gpoAuditCsv = Join-Path $env:SystemRoot 'security\audit\audit.csv'
+
+if ((Test-Path $gpoAuditCsv) -and (@(Get-Content $gpoAuditCsv | Where-Object { $_.Trim() }).Count -gt 1)) {
+
+    Write-Log 'Advanced Audit Policy is applied by GPO on this host. Local audit changes in STEP 1' 'WARN'
+
+    Write-Log 'will be overwritten at the next GPO refresh. Put STEP 1 into the GPO instead.' 'WARN'
+
+} else { Write-Log 'No GPO-delivered Advanced Audit Policy detected.' 'OK' }
+ 
+$sce = Get-RegState 'SYSTEM\CurrentControlSet\Control\Lsa' 'SCENoApplyLegacyAuditPolicy'
+
+if (-not ($sce.ValueExisted -and [int]$sce.Value -eq 1)) {
+
+    Write-Log "'Audit: Force audit policy subcategory settings' is not enabled - legacy category GPO settings" 'WARN'
+
+    Write-Log 'would override subcategory settings. (Not changed by this script.)' 'WARN'
+
+}
+ 
+if ($ScriptDir -match '\\etc\\(system|apps)\\') {
+
+    Write-Log "Script is running from a Splunk config folder ($ScriptDir). Move scripts and Sysmon files to e.g. C:\Tools." 'WARN'
+
+}
+ 
+# ── BACKUP ──────────────────────────────────────────────────────────
+
+if (-not $DryRun) {
+
+    Write-Section 'BACKUP OF CURRENT CONFIGURATION'
+
+    $auditBackup = Join-Path $WorkDir 'auditpol-before.csv'
+
+    $r = Invoke-Native 'auditpol.exe' @('/backup', "/file:$auditBackup")
+
+    if ($r.ExitCode -ne 0 -or -not (Test-Path $auditBackup)) {
+
+        Write-Log "auditpol /backup failed (exit $($r.ExitCode)). Refusing to continue without a rollback point." 'ERROR'; exit 2
+
+    }
+
+    $script:State.AuditBackup = $auditBackup
+
+    Save-State
+
+    Write-Log "Audit policy backup: $auditBackup" 'OK'
+ 
+    try { $null = Invoke-Native 'gpresult.exe' @('/scope', 'computer', '/h', (Join-Path $WorkDir 'gpresult-before.html'), '/f'); Write-Log 'gpresult saved' 'OK' }
+
+    catch { Write-Log "gpresult failed: $($_.Exception.Message)" 'WARN' }
+
+    try { Get-NetFirewallProfile | Format-List * | Out-File (Join-Path $WorkDir 'firewall-before.txt'); Write-Log 'Firewall profiles saved' 'OK' }
+
+    catch { Write-Log "Firewall export failed: $($_.Exception.Message)" 'WARN' }
+
+    Write-Log "Rollback command: .\$(Split-Path -Leaf $PSCommandPath) -Rollback `"$StateFile`"" 'OK'
+
+} else {
+
+    Write-Log 'DRY RUN - no backup taken, nothing will be changed.' 'PLAN'
+
+}
+ 
+# ── STEP 1: Audit policy ────────────────────────────────────────────
+
+Invoke-Step 'STEP 1: Advanced Audit Policy' {
+
+    $plan = @(
+
+        # Account Logon
+
+        @('Credential Validation',            'SuccessAndFailure'),
+
+        @('Other Account Logon Events',       'SuccessAndFailure'),
+
+        # Account Management
+
+        @('User Account Management',          'SuccessAndFailure'),
+
+        @('Security Group Management',        'Success'),
+
+        @('Computer Account Management',      'Success'),
+
+        @('Other Account Management Events',  'Success'),
+
+        # Detailed Tracking
+
+        @('Process Creation',                 'Success'),
+
+        @('Process Termination',              'None'),      # only acted on with -EnforceBaseline
+
+        @('Plug and Play Events',             'Success'),
+
+        @('RPC Events',                       'Success'),
+
+        # Logon/Logoff
+
+        @('Logon',                            'SuccessAndFailure'),
+
+        @('Logoff',                           'Success'),
+
+        @('Special Logon',                    'Success'),
+
+        @('Account Lockout',                  'Failure'),
+
+        @('Other Logon/Logoff Events',        'SuccessAndFailure'),
+
+        # Object Access
+
+        @('File Share',                       'SuccessAndFailure'),
+
+        @('Detailed File Share',              'Failure'),
+
+        @('Other Object Access Events',       'SuccessAndFailure'),
+
+        @('Removable Storage',                'SuccessAndFailure'),
+
+        # Policy Change
+
+        @('Audit Policy Change',              'Success'),
+
+        @('Authentication Policy Change',     'Success'),
+
+        @('MPSSVC Rule-Level Policy Change',  'Success'),
+
+        @('Other Policy Change Events',       'Failure'),
+
+        # Privilege Use  (enforce: Failure-only; 4674 success is high-volume noise)
+
+        @('Sensitive Privilege Use',          'Failure'),
+
+        # System         (enforce: System Integrity Failure-only; 5061 success is noise)
+
+        @('Security State Change',            'Success'),
+
+        @('Security System Extension',        'Success'),
+
+        @('System Integrity',                 'Failure')
+
     )
 
-    if ($r.ExitCode -eq 0) {
-        Write-Log "  Audit: [$Category] $Subcategory -> $Setting" "OK"
+    foreach ($p in $plan) { Set-AuditTracked -Subcategory $p[0] -Want $p[1] }
+
+}
+ 
+# ── STEP 2: Command line in 4688 ────────────────────────────────────
+
+Invoke-Step 'STEP 2: Command line in Process Creation events (4688)' {
+
+    Set-RegTracked 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled' 1
+
+}
+ 
+# ── STEP 3: Core log sizes (grow only) ──────────────────────────────
+
+Invoke-Step 'STEP 3: Core event log sizes (increase only)' {
+
+    Set-EventLogTracked 'Security'    2GB
+
+    Set-EventLogTracked 'System'      256MB
+
+    Set-EventLogTracked 'Application' 64MB
+
+}
+ 
+# ── STEP 4: PowerShell logging ──────────────────────────────────────
+
+Invoke-Step 'STEP 4: PowerShell Script Block + Module logging' {
+
+    Set-RegTracked 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'             'EnableScriptBlockLogging' 1
+
+    Set-RegTracked 'SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' 'EnableScriptBlockLogging' 1
+
+    if ($SkipModuleLogging) {
+
+        Write-Log '  Module logging (4103) skipped (-SkipModuleLogging).'
+
     } else {
-        Write-Log "  FAILED: $Subcategory (exit $($r.ExitCode)) $($r.Output -join ' ')" "ERROR"
+
+        Set-RegTracked 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging'                         'EnableModuleLogging' 1
+
+        Set-RegTracked 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames'             '*' '*' -Kind String
+
+        Set-RegTracked 'SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ModuleLogging'             'EnableModuleLogging' 1
+
+        Set-RegTracked 'SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames' '*' '*' -Kind String
+
     }
+
+    Set-EventLogTracked 'Microsoft-Windows-PowerShell/Operational' 256MB
+
 }
+ 
+# ── STEP 5: Operational channels ────────────────────────────────────
 
-function Set-RegValue {
-    param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord")
-    if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
-    Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force
-    Write-Log "  Registry: $Path\$Name = $Value" "OK"
+Invoke-Step 'STEP 5: Operational log channels (enable / grow only)' {
+
+    Set-EventLogTracked 'Microsoft-Windows-TaskScheduler/Operational'                            128MB -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-WMI-Activity/Operational'                             128MB -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'     64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational' 64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-Bits-Client/Operational'                              64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-CodeIntegrity/Operational'                            64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-NTLM/Operational'                                     64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-SMBClient/Security'                                   64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-PrintService/Operational'                             64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-Kernel-PnP/Configuration'                             64MB  -Enable
+
+    Set-EventLogTracked 'Microsoft-Windows-Windows Defender/Operational'                         128MB -Enable
+
 }
+ 
+# ── STEP 6: Firewall logging ────────────────────────────────────────
 
-function Set-EventLogSize {
-    param([string]$LogName, [long]$SizeBytes)
-    $r = Invoke-Native "wevtutil.exe" @("sl", $LogName, "/ms:$SizeBytes")
+Invoke-Step "STEP 6: Windows Firewall logging (dropped$(if (-not $DroppedOnly) { ' + allowed' }))" {
 
-    if ($r.ExitCode -ne 0) {
-        Write-Log "  Failed to set size for '$LogName' (exit $($r.ExitCode)): $($r.Output -join ' ')" "WARN"
+    $targetKB = 32767
+
+    foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore -ErrorAction Stop)) {
+
+        $needBlocked = "$($p.LogBlocked)" -ne 'True'
+
+        $needAllowed = (-not $DroppedOnly) -and ("$($p.LogAllowed)" -ne 'True')
+
+        $needSize    = [uint64]$p.LogMaxSizeKilobytes -lt $targetKB
+
+        if (-not ($needBlocked -or $needAllowed -or $needSize)) { Write-Log "  Unchanged: $($p.Name) profile"; continue }
+ 
+        $desc = @()
+
+        if ($needBlocked) { $desc += 'LogBlocked=True' }
+
+        if ($needAllowed) { $desc += 'LogAllowed=True' }
+
+        if ($needSize)    { $desc += "Size $($p.LogMaxSizeKilobytes)KB -> ${targetKB}KB" }
+
+        if ($DryRun) { Write-Log "  [DRYRUN] $($p.Name): $($desc -join ', ')" 'PLAN'; continue }
+ 
+        $script:State.Firewall += [pscustomobject]@{
+
+            Profile = $p.Name; LogBlocked = "$($p.LogBlocked)"; LogAllowed = "$($p.LogAllowed)"
+
+            LogMaxSizeKilobytes = [uint64]$p.LogMaxSizeKilobytes
+
+        }
+
+        Save-State
+
+        $fw = @{ Profile = $p.Name; PolicyStore = 'PersistentStore'; ErrorAction = 'Stop' }
+
+        if ($needBlocked) { $fw['LogBlocked'] = 'True' }
+
+        if ($needAllowed) { $fw['LogAllowed'] = 'True' }
+
+        if ($needSize)    { $fw['LogMaxSizeKilobytes'] = $targetKB }
+
+        Set-NetFirewallProfile @fw
+
+        Write-Log "  $($p.Name): $($desc -join ', ')" 'OK'
+
+    }
+
+    if (-not $DryRun) {
+
+        foreach ($a in @(Get-NetFirewallProfile -PolicyStore ActiveStore)) {
+
+            if ("$($a.LogBlocked)" -ne 'True') { Write-Log "  $($a.Name): effective LogBlocked=$($a.LogBlocked) - a GPO overrides the local setting." 'WARN' }
+
+        }
+
+    }
+
+}
+ 
+# ── STEP 7: Sysmon ──────────────────────────────────────────────────
+
+Invoke-Step 'STEP 7: Sysmon' {
+
+    if ($SkipSysmon) { Write-Log 'Skipped (-SkipSysmon).' 'WARN'; return }
+ 
+    $existing = @(Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue)
+
+    if ($existing.Count) {
+
+        $svcName = $existing[0].Name
+
+        if (-not $UpdateSysmonConfig) {
+
+            Write-Log "Sysmon already installed ($svcName, $($existing[0].Status)) - left untouched. Use -UpdateSysmonConfig to apply $SysmonConfig." 'WARN'
+
+            return
+
+        }
+
+        # Use the INSTALLED binary so the config is applied by the matching version.
+
+        $installed = Join-Path $env:SystemRoot "$svcName.exe"
+
+        if (-not (Test-Path $installed)) { throw "Installed Sysmon binary not found: $installed" }
+
+        if (-not (Test-Path $SysmonConfig)) { throw "Sysmon config not found: $SysmonConfig" }
+
+        try { [xml](Get-Content -Path $SysmonConfig -Raw) | Out-Null } catch { throw "Sysmon config is not valid XML: $($_.Exception.Message)" }
+ 
+        if ($DryRun) { Write-Log "  [DRYRUN] would apply $SysmonConfig to existing $svcName (not reversible by -Rollback)" 'PLAN'; return }
+ 
+        $dump = Invoke-Native $installed @('-c')
+
+        $dump.Output | Set-Content -Path (Join-Path $WorkDir 'sysmon-config-before.txt') -Encoding UTF8
+
+        Write-Log "  Current Sysmon config saved (for reference) to sysmon-config-before.txt"
+
+        $script:State.SysmonConfigUpdated = $true
+
+        Save-State
+
+        $r = Invoke-Native $installed @('-c', $SysmonConfig)
+
+        $r.Output | ForEach-Object { Write-Log "  Sysmon: $_" }
+
+        if ($r.ExitCode -eq 0) { Write-Log 'Sysmon config updated.' 'OK' } else { throw "Sysmon config update failed (exit $($r.ExitCode))." }
+
         return
+
+    }
+ 
+    if (-not (Test-Path $SysmonBinary)) { Write-Log "Sysmon binary not found: $SysmonBinary - skipped (download from Sysinternals)." 'WARN'; return }
+
+    if (-not (Test-Path $SysmonConfig)) { Write-Log "Sysmon config not found: $SysmonConfig - skipped." 'WARN'; return }
+
+    $sig = Get-AuthenticodeSignature -FilePath $SysmonBinary
+
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+
+        throw "$SysmonBinary is not validly signed by Microsoft (status: $($sig.Status))."
+
     }
 
-    $sizeMB = [math]::Round($SizeBytes / 1MB)
+    try { [xml](Get-Content -Path $SysmonConfig -Raw) | Out-Null } catch { throw "Sysmon config is not valid XML: $($_.Exception.Message)" }
+ 
+    if ($DryRun) { Write-Log "  [DRYRUN] would install Sysmon ($SysmonBinary) with $SysmonConfig" 'PLAN'; return }
 
-    # wevtutil exits 0 even when a policy value silently overrides what it just
-    # wrote, so confirm the channel actually reports the requested size.
-    $effective = $null
-    try { $effective = (Get-WinEvent -ListLog $LogName -ErrorAction Stop).MaximumSizeInBytes } catch { }
+    $script:State.SysmonInstalled = $true
 
-    if ($null -ne $effective -and $effective -ne $SizeBytes) {
-        Write-Log "  Log size for '$LogName' NOT APPLIED - requested $sizeMB MB, effective $([math]::Round($effective/1MB)) MB" "WARN"
-        Write-Log "    Overridden by policy. On a DC this is almost always the Default Domain" "WARN"
-        Write-Log "    Controllers Policy GPO: Computer Configuration > Policies > Administrative" "WARN"
-        Write-Log "    Templates > Windows Components > Event Log Service > $LogName (size in KB)" "WARN"
-    } else {
-        Write-Log "  Log size: '$LogName' -> $sizeMB MB" "OK"
-    }
+    Save-State
+
+    $r = Invoke-Native $SysmonBinary @('-accepteula', '-i', $SysmonConfig)
+
+    $r.Output | ForEach-Object { Write-Log "  Sysmon: $_" }
+
+    $svc = Get-Service -Name 'Sysmon64' -ErrorAction SilentlyContinue
+
+    if ($svc -and $svc.Status -eq 'Running') { Write-Log 'Sysmon installed and running.' 'OK' }
+
+    else { throw "Sysmon install failed (exit $($r.ExitCode))." }
+
 }
+ 
+# ── STEP 8: AppLocker channels ──────────────────────────────────────
 
-function Enable-EventLog {
-    param([string]$LogName, [long]$SizeBytes = 134217728)
-    $probe = Invoke-Native "wevtutil.exe" @("gl", $LogName)
+Invoke-Step 'STEP 8: AppLocker log channels (policy itself must come from GPO)' {
 
-    if ($probe.ExitCode -ne 0) {
-        Write-Log "  Channel not available on this host: '$LogName' - skipping" "WARN"
-        return
-    }
+    Set-EventLogTracked 'Microsoft-Windows-AppLocker/EXE and DLL'   64MB -Enable
 
-    if ($probe.Output -match "enabled: false") {
-        $r = Invoke-Native "wevtutil.exe" @("sl", $LogName, "/e:true", "/ms:$SizeBytes")
-        $action = "Enabled log"
-    } else {
-        $r = Invoke-Native "wevtutil.exe" @("sl", $LogName, "/ms:$SizeBytes")
-        $action = "Log already enabled (size updated)"
-    }
+    Set-EventLogTracked 'Microsoft-Windows-AppLocker/MSI and Script' 64MB -Enable
+ 
+    $ruleCollections = -1
 
-    if ($r.ExitCode -eq 0) {
-        Write-Log "  ${action}: '$LogName'" "OK"
-    } else {
-        Write-Log "  Failed to configure '$LogName' (exit $($r.ExitCode)): $($r.Output -join ' ')" "WARN"
-    }
-}
-
-# ═══════════════════════════════════════════════════════════════════
-# START
-# ═══════════════════════════════════════════════════════════════════
-Write-Host ""
-Write-Host "  Splunk UF Prerequisite - Windows Domain Controller" -ForegroundColor White
-Write-Host "  Log file: $LogFile" -ForegroundColor Gray
-Write-Host ""
-
-# Confirm this is a DC
-$dcRole = (Get-CimInstance Win32_ComputerSystem).DomainRole
-
-if ($dcRole -lt 4) {
-    Write-Log "WARNING: This machine does not appear to be a Domain Controller (DomainRole=$dcRole)." "WARN"
-    Write-Log "DC-specific audit policies (Kerberos, DS Access) will apply but produce no events." "WARN"
-
-    # Never block on input: this script is deployed unattended (GPO / scheduled
-    # task / remoting), where Read-Host reads EOF and no one sees the prompt.
-    if ($Force) {
-        Write-Log "-Force specified - continuing on a non-DC host." "WARN"
-    } else {
-        Write-Log "Refusing to run on a non-DC. Re-run with -Force to override." "ERROR"
-        exit 2
-    }
-}
-
-# ── STEP 1: All Workstation Audit Policies ─────────────────────────
-Invoke-Step "STEP 1: Base Audit Policies (Workstation + DC)" {
-Write-Log "Source: NSA EFG, CIS Benchmark sec 17, Microsoft Appendix L"
-
-# Account Logon
-Set-AuditPolicy "Account Logon" "Credential Validation"               "Success and Failure"
-Set-AuditPolicy "Account Logon" "Kerberos Authentication Service"     "Success and Failure"  # DC-specific: 4768, 4771
-Set-AuditPolicy "Account Logon" "Kerberos Service Ticket Operations"  "Success and Failure"  # DC-specific: 4769, 4770
-Set-AuditPolicy "Account Logon" "Other Account Logon Events"          "Success and Failure"
-
-# Account Management
-Set-AuditPolicy "Account Management" "User Account Management"        "Success and Failure"
-Set-AuditPolicy "Account Management" "Security Group Management"      "Success"
-Set-AuditPolicy "Account Management" "Computer Account Management"    "Success"              # DC: 4741-4743
-Set-AuditPolicy "Account Management" "Distribution Group Management"  "Success"
-Set-AuditPolicy "Account Management" "Other Account Management Events" "Success"
-
-# Detailed Tracking
-Set-AuditPolicy "Detailed Tracking" "Process Creation"                "Success"
-# 4689 fires 1:1 with 4688 and is not forwarded; Sysmon EID 5 covers process
-# termination. Set explicitly rather than omitted - omitting leaves it enabled
-# on controllers where an earlier run or a baseline turned it on.
-Set-AuditPolicy "Detailed Tracking" "Process Termination"             "No Auditing"
-Set-AuditPolicy "Detailed Tracking" "Plug and Play Events"                    "Success"
-Set-AuditPolicy "Detailed Tracking" "RPC Events"                      "Success"
-
-# DS Access - DC-SPECIFIC
-Write-Log "Applying DC-specific DS Access audit policies..."
-Set-AuditPolicy "DS Access" "Directory Service Changes"               "Success"              # 5136-5141
-Set-AuditPolicy "DS Access" "Directory Service Access"                "Success and Failure"  # 4662 (DCSync)
-Set-AuditPolicy "DS Access" "Directory Service Replication"           "Success and Failure"  # 4932, 4933
-Set-AuditPolicy "DS Access" "Detailed Directory Service Replication"  "Failure"
-
-# Logon/Logoff
-Set-AuditPolicy "Logon/Logoff" "Logon"                                "Success and Failure"
-Set-AuditPolicy "Logon/Logoff" "Logoff"                               "Success"
-Set-AuditPolicy "Logon/Logoff" "Special Logon"                        "Success"
-Set-AuditPolicy "Logon/Logoff" "Account Lockout"                      "Failure"
-Set-AuditPolicy "Logon/Logoff" "Other Logon/Logoff Events"            "Success and Failure"
-
-# Object Access
-Set-AuditPolicy "Object Access" "File Share"                          "Success and Failure"
-Set-AuditPolicy "Object Access" "Detailed File Share"                 "Failure"
-Set-AuditPolicy "Object Access" "Other Object Access Events"          "Success and Failure"
-Set-AuditPolicy "Object Access" "Certification Services"              "Success and Failure"  # ADCS on DC
-Set-AuditPolicy "Object Access" "Removable Storage"              "Success and Failure"  # USB on a DC is always notable
-
-# Policy Change
-Set-AuditPolicy "Policy Change" "Audit Policy Change"                 "Success"
-Set-AuditPolicy "Policy Change" "Authentication Policy Change"        "Success"
-Set-AuditPolicy "Policy Change" "MPSSVC Rule-Level Policy Change"     "Success"
-Set-AuditPolicy "Policy Change" "Other Policy Change Events"          "Failure"
-
-# Privilege Use - DC-SPECIFIC (SeDebug on DC = high criticality)
-Set-AuditPolicy "Privilege Use" "Sensitive Privilege Use"             "Success and Failure"
-Set-AuditPolicy "Privilege Use" "Non Sensitive Privilege Use"         "Failure"
-
-# System
-Set-AuditPolicy "System" "Security State Change"                      "Success"
-Set-AuditPolicy "System" "Security System Extension"                  "Success"
-# Failure-only: successful 5061 (cryptographic operation) is high volume on a
-# DC because Kerberos emits one per operation, and it is not forwarded.
-# Failures retain 5038 (image hash invalid) and 5056/5057 (crypto self-test).
-Set-AuditPolicy "System" "System Integrity"                           "Failure"
-
-Write-Log "Audit policy configuration complete." "OK"
-}
-
-# ── STEP 2: Process Creation Command-Line ──────────────────────────
-Invoke-Step "STEP 2: Enable Command-Line Logging in Process Creation Events" {
-Set-RegValue `
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" `
-    "ProcessCreationIncludeCmdLine_Enabled" 1
-}
-
-# ── STEP 3: Event Log Sizes ─────────────────────────────────────────
-Invoke-Step "STEP 3: Increase Event Log Sizes" {
-Write-Log "DC logs receive higher volume - Directory Service log set to 512 MB"
-
-Set-EventLogSize "Security"           2147483648   # 2 GB
-Set-EventLogSize "System"             268435456    # 256 MB
-Set-EventLogSize "Application"        67108864     # 64 MB
-Set-EventLogSize "Directory Service"  536870912    # 512 MB  (DC-specific)
-}
-
-# ── STEP 4: PowerShell Logging ─────────────────────────────────────
-Invoke-Step "STEP 4: PowerShell Module + Script Block Logging" {
-Write-Log "Source: Mandiant PowerShell Logging guidance, Splunk UBA prerequisites"
-
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" `
-    "EnableModuleLogging" 1
-
-$mlPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames"
-if (-not (Test-Path $mlPath)) { New-Item -Path $mlPath -Force | Out-Null }
-Set-ItemProperty -Path $mlPath -Name "*" -Value "*" -Type String -Force
-Write-Log "  Module Logging wildcard (*) set" "OK"
-
-Set-RegValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" `
-    "EnableScriptBlockLogging" 1
-
-Set-RegValue "HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ModuleLogging" `
-    "EnableModuleLogging" 1
-Set-RegValue "HKLM:\SOFTWARE\Wow6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" `
-    "EnableScriptBlockLogging" 1
-
-Write-Log "PowerShell logging enabled (EID 4103 + 4104)." "OK"
-}
-
-# ── STEP 5: Operational Logs ────────────────────────────────────────
-Invoke-Step "STEP 5: Enable Operational Log Channels" {
-Write-Log "Source: NSA EFG, Palantir WEF, ACSC, TrustedSec SysmonCommunityGuide"
-
-Enable-EventLog "Microsoft-Windows-TaskScheduler/Operational"                         134217728
-Enable-EventLog "Microsoft-Windows-WMI-Activity/Operational"                          134217728
-Enable-EventLog "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational"  67108864
-Enable-EventLog "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational" 67108864
-Enable-EventLog "Microsoft-Windows-Bits-Client/Operational"                           67108864
-Enable-EventLog "Microsoft-Windows-CodeIntegrity/Operational"                         67108864
-Enable-EventLog "Microsoft-Windows-NTLM/Operational"                                  67108864
-Enable-EventLog "Microsoft-Windows-SMBClient/Security"                                67108864
-Enable-EventLog "Microsoft-Windows-Windows Defender/Operational"                      134217728
-Enable-EventLog "Microsoft-Windows-Kernel-PnP/Configuration"                          67108864
-Enable-EventLog "Microsoft-Windows-PrintService/Operational"                          67108864
-
-# DC-specific operational logs
-Enable-EventLog "DFS Replication"                                                      134217728
-
-# NOT enabled: Microsoft-Windows-DNS-Server/Analytical. It is an ETW analytic
-# channel that logs every DNS query - far higher volume than the dns.log debug
-# file that STEP 7 configures and that inputs.conf already monitors. Collecting
-# both is duplicate coverage. If you prefer the analytic channel over dns.log
-# (Microsoft recommends it on performance grounds), enable it here, add a
-# matching stanza to inputs.conf, and drop the [monitor://...dns.log] stanza.
-
-# ADFS (only if ADFS role is present)
-$adfsService = Get-Service -Name "adfssrv" -ErrorAction SilentlyContinue
-if ($adfsService) {
-    Write-Log "ADFS service detected - enabling ADFS logs" "OK"
-    Enable-EventLog "AD FS/Admin"           67108864
-    # AD FS Tracing/Debug intentionally not enabled: a verbose troubleshooting
-    # channel that nothing collects. Enable it by hand when diagnosing ADFS.
-} else {
-    Write-Log "ADFS service not present - skipping ADFS log enablement" "WARN"
-}
-
-Write-Log "Operational log channels enabled." "OK"
-}
-
-# ── STEP 6: Firewall Logging ────────────────────────────────────────
-Invoke-Step "STEP 6: Windows Firewall Logging" {
-try {
-    Set-NetFirewallProfile -All -LogBlocked True -LogAllowed True -LogMaxSizeKilobytes 32767
-    Write-Log "  Firewall logging enabled (all profiles)" "OK"
-} catch {
-    netsh advfirewall set allprofiles logging droppedconnections enable | Out-Null
-    netsh advfirewall set allprofiles logging allowedconnections enable | Out-Null
-    netsh advfirewall set allprofiles logging maxfilesize 32767         | Out-Null
-    Write-Log "  Firewall logging enabled via netsh (fallback)" "OK"
-}
-}
-
-# ── STEP 7: DNS Debug Logging ───────────────────────────────────────
-Invoke-Step "STEP 7: DNS Server Debug Logging" {
-Write-Log "Source: Configuration Guide sec 3.1.2 - enables dns.log for T1071.004 / DGA detection"
-
-if ($SkipDNSLogging) {
-    Write-Log "DNS debug logging skipped (-SkipDNSLogging flag set)." "WARN"
-} else {
-    $dnsService = Get-Service -Name "DNS" -ErrorAction SilentlyContinue
-    if ($dnsService) {
-        try {
-            # Enable all DNS diagnostic categories
-            Set-DnsServerDiagnostics -All $true -ErrorAction Stop
-            Write-Log "  DNS debug logging enabled via Set-DnsServerDiagnostics" "OK"
-            Write-Log "  Log location: $env:SystemRoot\System32\dns\dns.log" "OK"
-
-            # Set DNS log file path and max size
-            $dnsRegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\DNS\Parameters"
-            Set-RegValue $dnsRegPath "LogFilePath"    "$env:SystemRoot\System32\dns\dns.log" "String"
-            Set-RegValue $dnsRegPath "MaximumLogFileSize" 100663296   # 96 MB
-
-            Write-Log "DNS debug logging configured. File: $env:SystemRoot\System32\dns\dns.log" "OK"
-            Write-Log "Add monitor stanza for this path in inputs.conf (DC section)." "WARN"
-        } catch {
-            Write-Log "  DNS cmdlet failed: $_ - trying netsh dns approach" "WARN"
-            $r = Invoke-Native "dnscmd.exe" @("/config", "/LogLevel", "0x8100F331")
-
-            if ($r.ExitCode -eq 0) {
-                Write-Log "  DNS logging enabled via dnscmd" "OK"
-            } else {
-                Write-Log "  dnscmd fallback failed (exit $($r.ExitCode)): $($r.Output -join ' ')" "WARN"
-            }
-        }
-    } else {
-        Write-Log "DNS Server service not found - this DC may not host the DNS role." "WARN"
-    }
-}
-}
-
-# ── STEP 8: LDAP Channel Binding / Signing Events ──────────────────
-Invoke-Step "STEP 8: Enable LDAP Signing / Channel Binding Diagnostic Events" {
-Write-Log "Enables Directory Service EIDs 2887, 2888, 2889 (LDAP security posture)"
-
-Set-RegValue "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics" `
-    "16 LDAP Interface Events" 2   # 2 = Basic
-
-Write-Log "  LDAP Interface Events diagnostics set to level 2 (EIDs 2886-2889 will appear in Directory Service log)" "OK"
-}
-
-# ── STEP 9: Sysmon ─────────────────────────────────────────────────
-Invoke-Step "STEP 9: Sysmon Deployment" {
-Write-Log "Source: SwiftOnSecurity sysmon-config, Olaf Hartong sysmon-modular"
-
-if ($SkipSysmon) {
-    Write-Log "Sysmon deployment skipped." "WARN"
-} else {
-    $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
-    if (-not $sysmonSvc) { $sysmonSvc = Get-Service -Name "Sysmon" -ErrorAction SilentlyContinue }
-
-    if ($sysmonSvc) {
-        Write-Log "Sysmon already installed. Updating config." "WARN"
-        if (Test-Path $SysmonConfig) {
-            $r = Invoke-Native $SysmonBinary @("-c", $SysmonConfig)
-            $r.Output | ForEach-Object { Write-Log "  Sysmon: $_" }
-
-            if ($r.ExitCode -eq 0) {
-                Write-Log "Sysmon config updated." "OK"
-            } else {
-                Write-Log "Sysmon config update FAILED (exit $($r.ExitCode))." "ERROR"
-            }
-        } else {
-            Write-Log "Config not found: $SysmonConfig" "WARN"
-        }
-    } elseif (Test-Path $SysmonBinary) {
-        if (Test-Path $SysmonConfig) {
-            $r = Invoke-Native $SysmonBinary @("-accepteula", "-i", $SysmonConfig)
-            $r.Output | ForEach-Object { Write-Log "  Sysmon: $_" }
-
-            $svc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
-            if ($svc) { Write-Log "Sysmon installed and running." "OK" }
-            else       { Write-Log "Sysmon install FAILED (exit $($r.ExitCode))." "ERROR" }
-        } else {
-            Write-Log "Sysmon config not found: $SysmonConfig" "WARN"
-            Write-Log "Download: https://github.com/SwiftOnSecurity/sysmon-config" "WARN"
-        }
-    } else {
-        Write-Log "Sysmon binary not found: $SysmonBinary" "WARN"
-        Write-Log "Download: https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon" "WARN"
-    }
-}
-}
-
-# ── STEP 10: Validation ─────────────────────────────────────────────
-Invoke-Step "STEP 10: Validation" {
-$checks = @(
-    @{ Name="Process Creation (Success)";  Cmd={ (Invoke-Native "auditpol.exe" @("/get","/subcategory:Process Creation")).Output -match "Success" } },
-    @{ Name="Kerberos Auth Service";       Cmd={ (Invoke-Native "auditpol.exe" @("/get","/subcategory:Kerberos Authentication Service")).Output -match "Success" } },
-    @{ Name="Directory Service Changes";   Cmd={ (Invoke-Native "auditpol.exe" @("/get","/subcategory:Directory Service Changes")).Output -match "Success" } },
-    @{ Name="Directory Service Access";    Cmd={ (Invoke-Native "auditpol.exe" @("/get","/subcategory:Directory Service Access")).Output -match "Success" } },
-    @{ Name="Command-line registry";       Cmd={
-        $v = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" `
-            -Name "ProcessCreationIncludeCmdLine_Enabled" -ErrorAction SilentlyContinue
-        $v -and $v.ProcessCreationIncludeCmdLine_Enabled -eq 1
-    }},
-    @{ Name="PS ScriptBlock logging";      Cmd={
-        $v = Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" `
-            -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
-        $v -and $v.EnableScriptBlockLogging -eq 1
-    }},
-    @{ Name="Sysmon service running";      Cmd={
-        $s = Get-Service "Sysmon64" -ErrorAction SilentlyContinue
-        if (-not $s) { $s = Get-Service "Sysmon" -ErrorAction SilentlyContinue }
-        $s -and $s.Status -eq "Running"
-    }}
-)
-
-foreach ($check in $checks) {
     try {
-        $result = & $check.Cmd
-        if ($result) { Write-Log "  PASS: $($check.Name)" "OK"   }
-        else          { Write-Log "  FAIL: $($check.Name)" "ERROR" }
-    } catch {
-        Write-Log "  ERROR checking $($check.Name): $_" "WARN"
+
+        $x = [xml](Get-AppLockerPolicy -Effective -Xml)
+
+        $ruleCollections = $x.SelectNodes("//RuleCollection[@EnforcementMode and @EnforcementMode!='NotConfigured']").Count
+
+    } catch { }
+
+    $appId = Get-Service -Name 'AppIDSvc' -ErrorAction SilentlyContinue
+
+    $appIdText = if ($appId) { "$($appId.Status)/$($appId.StartType)" } else { 'not present' }
+ 
+    if ($ruleCollections -gt 0) {
+
+        Write-Log "  AppLocker policy present ($ruleCollections rule collection(s)); AppIDSvc = $appIdText" 'OK'
+
+        if ($appId -and $appId.Status -ne 'Running') { Write-Log '  AppIDSvc is not running - set it to Automatic via GPO (System Services).' 'WARN' }
+
+    } else {
+
+        Write-Log "  No AppLocker policy configured - 8002-8007 events will not be generated. AppIDSvc = $appIdText" 'WARN'
+
+        Write-Log '  Deploy an Audit-only AppLocker policy + AppIDSvc Automatic via GPO (the service is protected;' 'WARN'
+
+        Write-Log "  Set-Service fails with 'Access is denied' even as administrator)." 'WARN'
+
     }
-}
-}
 
+}
+ 
+# ── STEP 9: Validation ──────────────────────────────────────────────
+
+if (-not $DryRun) {
+
+    Invoke-Step 'STEP 9: Validation' {
+
+        $pc = Get-AuditInclusion 'Process Creation'
+
+        Write-Log "  Process Creation audit = $pc" $(if ($pc -match 'Success') { 'OK' } else { 'ERROR' })
+ 
+        $cl = Get-RegState 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit' 'ProcessCreationIncludeCmdLine_Enabled'
+
+        Write-Log "  4688 command line = $($cl.Value)" $(if ($cl.ValueExisted -and [int]$cl.Value -eq 1) { 'OK' } else { 'ERROR' })
+ 
+        $sb = Get-RegState 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' 'EnableScriptBlockLogging'
+
+        Write-Log "  Script block logging = $($sb.Value)" $(if ($sb.ValueExisted -and [int]$sb.Value -eq 1) { 'OK' } else { 'ERROR' })
+ 
+        if (-not $SkipModuleLogging) {
+
+            $ml = Get-RegState 'SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging\ModuleNames' '*'
+
+            Write-Log "  Module logging ModuleNames '*' = $($ml.Value)" $(if ($ml.ValueExisted) { 'OK' } else { 'ERROR' })
+
+        }
+ 
+        $sec = Get-WinEvent -ListLog Security
+
+        Write-Log "  Security log max = $([math]::Round($sec.MaximumSizeInBytes/1MB)) MB" 'OK'
+ 
+        $svc = @(Get-Service -Name 'Sysmon64', 'Sysmon' -ErrorAction SilentlyContinue) | Select-Object -First 1
+
+        if ($svc) { Write-Log "  Sysmon service $($svc.Name) = $($svc.Status)" $(if ($svc.Status -eq 'Running') { 'OK' } else { 'WARN' }) }
+
+        else { Write-Log '  Sysmon not installed' $(if ($SkipSysmon) { 'INFO' } else { 'WARN' }) }
+
+    }
+
+}
+ 
 # ── DONE ────────────────────────────────────────────────────────────
-$hasFailures = $script:FailedSteps.Count -gt 0
-$bannerColor = if ($hasFailures) { "Red" } else { "Green" }
-$headline    = if ($hasFailures) {
-    "  COMPLETED WITH ERRORS - Domain Controller Logging Prerequisites"
-} else {
-    "  COMPLETED - Domain Controller Logging Prerequisites"
+
+$failed = $script:FailedSteps.Count -gt 0
+
+$color  = if ($failed) { 'Red' } else { 'Green' }
+
+$head   = if ($failed) { ' COMPLETED WITH ERRORS' } elseif ($DryRun) { ' DRY RUN COMPLETE - nothing was changed' } else { ' COMPLETED' }
+
+Write-Host ''
+
+Write-Host ('=' * 70) -ForegroundColor $color
+
+Write-Host $head -ForegroundColor $color
+
+Write-Host ('=' * 70) -ForegroundColor $color
+
+if ($failed) { $script:FailedSteps | ForEach-Object { Write-Log "  failed: $_" 'ERROR' } }
+
+Write-Log "Log: $LogFile"
+
+if (-not $DryRun) {
+
+    Write-Log "State (rollback point): $StateFile"
+
+    Write-Log "Rollback: .\$(Split-Path -Leaf $PSCommandPath) -Rollback `"$StateFile`""
+
 }
 
-Write-Host ""
-Write-Host ("=" * 70) -ForegroundColor $bannerColor
-Write-Host $headline -ForegroundColor $bannerColor
-Write-Host ("=" * 70) -ForegroundColor $bannerColor
-Write-Host ""
-
-if ($hasFailures) {
-    Write-Log "$($script:FailedSteps.Count) step(s) failed:" "ERROR"
-    foreach ($f in $script:FailedSteps) { Write-Log "  - $f" "ERROR" }
-} else {
-    Write-Log "All steps completed successfully." "OK"
-}
-
-Write-Log "Full log saved to: $LogFile"
-Write-Host ""
-Write-Host "  Next steps:" -ForegroundColor Yellow
-$splunkHome = if ($env:SPLUNK_HOME) {
-    $env:SPLUNK_HOME
-} else {
-    "C:\Program Files\SplunkUniversalForwarder"
-}
-
-Write-Host "  1. Deploy DC inputs.conf to: $splunkHome\etc\system\local\" -ForegroundColor Yellow
-Write-Host "  2. Deploy outputs.conf to: $splunkHome\etc\system\local\" -ForegroundColor Yellow
-Write-Host "  3. Restart Splunk UF: Restart-Service SplunkForwarder" -ForegroundColor Yellow
-Write-Host "  4. Verify dns.log path in inputs.conf matches: $env:SystemRoot\System32\dns\dns.log" -ForegroundColor Yellow
-Write-Host ""
-
-# Exit non-zero when any step failed, so GPO / SCCM / Intune can detect it.
-if ($script:FailedSteps.Count -gt 0) {
-    exit 1
-}
-
-exit 0
+exit $(if ($failed) { 1 } else { 0 })
+ 
