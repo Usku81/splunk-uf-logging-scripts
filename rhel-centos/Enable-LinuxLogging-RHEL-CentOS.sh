@@ -2,20 +2,32 @@
 # =============================================================================
 # Enable-LinuxLogging-RHEL-CentOS.sh
 #
-# PURPOSE  : Enable all prerequisite logging for Splunk UF collection on
+# PURPOSE  : Enable prerequisite logging for Splunk UF collection — BUDGET
+#            PROFILE (~62 MB/host/day, all Linux sources) — on
 #            RHEL 8/9 and CentOS 8 Stream.
 #
 # APPLIES  : - auditd enablement + Neo23x0 ruleset (pinned, with an optional
 #              vendored fallback so every host in a fleet gets identical rules)
 #            - auditd.conf tuning (RAW format, dedupe, log rotation)
-#            - audit volume curation: cuts file_access, file_creation and
-#              file_modification (EACCES/EPERM noise) and network_socket_created;
-#              narrows perm_mod and delete to security-relevant paths; keeps
-#              process_creation system-wide and deliberately un-scoped by auid
+#            - BUDGET PROFILE audit curation, sized from byte attribution on
+#              20 production hosts to fit ~62 MB/host/day for ALL Linux sources
+#              (baseline was 510-590 MB/host/day of audit.log alone):
+#                * daemon executions narrowed to attacker-useful binaries and
+#                  writable-directory execution; login sessions kept in full
+#                * outbound connect kept for login sessions + reverse-shell tools
+#                * PROCTITLE dropped (duplicates EXECVE argv); CWD for daemons
+#                * exact (exe, syscall) suppressions for Netdata IPC/eBPF,
+#                  dockerd/containerd mknod, and the forwarder reading audit.log
+#                * namespaces scoped to unprivileged users + login sessions
+#                * /var/lib/docker data watch dropped (/etc/docker kept)
+#                * plus the original cuts: file_access/creation/modification,
+#                  network_socket_created; perm_mod/delete narrowed to paths
+#            - curated syslog feed (/var/log/splunk-syslog.log) via rsyslog;
+#              the local syslog files are left untouched
 #            - rsyslog verification (/var/log/secure, /var/log/messages)
 #            - SELinux verification (Enforcing mode)
 #            - journald persistent storage
-#            - Sysmon for Linux (optional)
+#            - Sysmon for Linux (opt-in: --with-sysmon)
 #            - File permissions for Splunk UF
 #
 # SOURCES  : Neo23x0/auditd, bfuzzy/auditd-attack, MITRE ATT&CK M1047,
@@ -26,12 +38,19 @@
 #   sudo bash Enable-LinuxLogging-RHEL-CentOS.sh [OPTIONS]
 #
 #   Options:
-#     --skip-sysmon          Skip Sysmon for Linux installation
+#     --full-exec            Keep process_creation system-wide for daemons too
+#                            (original behaviour; ~+35 MB/host/day)
+#     --full-connect         Keep connect() system-wide (~+50 MB/host/day)
+#     --with-sysmon          Install Sysmon for Linux (OFF by default in the
+#                            budget profile; its starter config is unfiltered)
 #     --skip-auditd-rules    Skip downloading Neo23x0 rules (use existing)
-#     --skip-volume-tuning   Keep the stock Neo23x0 ruleset verbatim (do not
-#                            narrow perm_mod / disable file_access)
-#     --splunk-user USER     Splunk UF run-as user (default: splunk)
+#     --skip-volume-tuning   Install the pinned Neo23x0 ruleset verbatim,
+#                            applying no cuts or narrowing (NOT budget-safe)
+#     --splunk-user USER     Splunk UF run-as user (default: splunkfwd)
 #     --help                 Show this help
+#
+#   Site suppressions: put '-a never,...' lines in audit.site-suppressions.rules
+#   next to this script; they are copied to the top of the managed block.
 #
 # REQUIREMENTS : RHEL 8/9 or CentOS 8 Stream, run as root / sudo
 # =============================================================================
@@ -39,7 +58,9 @@
 set -euo pipefail
 
 # ── Defaults ───────────────────────────────────────────────────────
-SKIP_SYSMON=false
+SKIP_SYSMON=true            # budget profile: Sysmon is opt-in
+FULL_EXEC=false
+FULL_CONNECT=false
 SKIP_AUDITD_RULES=false
 SKIP_VOLUME_TUNING=false
 SPLUNK_USER="splunkfwd"
@@ -63,12 +84,15 @@ CYAN='\033[0;36m'; NC='\033[0m'; BOLD='\033[1m'
 # ── Parse args ─────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-sysmon)       SKIP_SYSMON=true        ;;
+        --skip-sysmon)       SKIP_SYSMON=true        ;;   # default; kept for compatibility
+        --with-sysmon)       SKIP_SYSMON=false       ;;
+        --full-exec)         FULL_EXEC=true          ;;
+        --full-connect)      FULL_CONNECT=true       ;;
         --skip-auditd-rules) SKIP_AUDITD_RULES=true  ;;
         --skip-volume-tuning) SKIP_VOLUME_TUNING=true ;;
         --splunk-user)       SPLUNK_USER="$2"; shift  ;;
         --help)
-            grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,1\}//'
+            awk 'NR>1 && /^# =+$/ {if (++n == 2) exit; next} NR>1 {sub(/^# ?/, ""); print}' "$0"
             exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -207,123 +231,311 @@ else
     fi
 fi
 
-# ── Volume tuning ─────────────────────────────────────────────────
+# ── Volume tuning: BUDGET PROFILE ─────────────────────────────────
 # Runs after the download, because the download overwrites any edits.
 #
-# Rationale, from byte-attribution on a reference endpoint (see README,
-# "Measuring audit volume"): the stock Neo23x0 ruleset applies perm_mod
-# system-wide, so it fires on every package install and every recursive
-# chown, and file_access records failed opens (EACCES/EPERM) by ordinary
-# users, which are overwhelmingly benign. Both are high-volume, low-yield.
+# BUDGET: 4.2 GB/day for 69 hosts = ~62.3 MB/host/day, ALL Linux sources.
+# Baseline before this profile: 510-590 MB/host/day of audit.log alone,
+# measured across 20 production hosts (Splunk license_usage + per-record
+# byte attribution, Oct 2026). Every cut below is sized from that data.
+#
+# Measured composition of the baseline audit bytes, per host per day:
+#   process_creation  ~300 MB  (58%)  59% of it was Netdata polling:
+#                                     tc ~1.5/s, ndsudo->chronyc ~1/s
+#   network_connect_4  ~73 MB  (15%)  long-running daemons (haproxy,
+#                                     beats, app runtimes) re-connecting
+#   docker watch       ~26 MB   (5%)  container apps writing into
+#                                     /var/lib/docker (mongod, java)
+#   namespaces         ~25 MB   (5%)  98% runc entering container ns
+#   IPC                ~22 MB   (4%)  100% Netdata shmget/semctl
+#   specialfiles       ~18 MB   (4%)  97% dockerd mknod (overlay whiteouts)
+#   bpf                ~18 MB   (4%)  100% Netdata eBPF plugins
+#   other               ~20 MB
+# Record types: PROCTITLE was 17% of all bytes and duplicates EXECVE's argv
+# for every execve event.
+#
+# Projected after this profile (same hosts, same window): ~51 MB/host/day
+# of audit as an UPPER bound (container-internal shells counted as kept;
+# they are in fact dropped, see POLICY 1). Plus ~3-5 MB curated syslog and
+# <0.5 MB auth/package logs. Re-measure after rollout - see README.
+#
+# POLICY 1 - process execution (process_creation)
+#   Kept in full for every process with a login identity (auid set): SSH,
+#   console, sudo/su from a session, and cron jobs (pam_loginuid sets auid).
+#   For daemon-spawned processes (auid unset) only the executions an
+#   attacker needs are kept:
+#     * host shells, network tools, interpreters, encoders, account,
+#       scheduling, module, compiler and capture tools (LOLBIN list below)
+#     * ANY binary executed from a user-writable or staging directory
+#       (/tmp, /var/tmp, /dev/shm, /home, /root, /run/user, /var/www, /srv)
+#     * every 32-bit execution (only the b64 path is narrowed)
+#   A web shell (www-data -> sh -c '...') stays fully visible: sh is on the
+#   list and its EXECVE record carries the whole command string. What is
+#   dropped is the routine fan-out of service binaries (tc, chronyc, runc,
+#   rpm, docker CLI polling, pg_isready...) and processes inside container
+#   images: -F exe= matches the HOST inode, so a container's own /bin/sh is
+#   not on the list. That is the main detection gap of this profile -
+#   see the README section "What the budget profile gives up".
+#   --full-exec restores the original system-wide rule (~+35 MB/host/day).
+#
+# POLICY 2 - outbound connect (network_connect_4 / _6)
+#   Kept for every login-identity process, plus shells, netcat variants,
+#   socat, telnet and perl from ANY context (reverse shells). Long-running
+#   daemon connects are dropped - perimeter firewall logs (Check Point)
+#   already carry the cross-segment flows. --full-connect restores it.
+#
+# POLICY 3 - container and agent noise, by exact (exe, syscall) pairs
+#   Netdata IPC/eBPF, dockerd/containerd mknod, and the Splunk forwarder
+#   reading /var/log/audit. These are agents doing their documented job.
+#   An exe= suppression is a gap for that one binary only; the binaries
+#   live under /usr, which the usr_writes rule still watches for tampering.
 tune_audit_volume() {
     local RULES="${1:-/etc/audit/rules.d/audit.rules}"
     local BEG="## >>> BEGIN volume-tuning (managed) >>>"
     local END="## <<< END volume-tuning (managed) <<<"
+    local OFF="## [volume-tuning disabled] "
+    local SITE_FILE
+    SITE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/audit.site-suppressions.rules"
 
     if [[ ! -f "$RULES" ]]; then
         warn "No ruleset at $RULES — skipping volume tuning."
         return 0
     fi
 
-    # Idempotent: drop any previous managed block, re-enable prior disables.
-    # Both markers must be stripped, or a re-run without a fresh download
-    # (--skip-auditd-rules) would prefix already-prefixed lines.
+    # ── 0. Idempotent reset ───────────────────────────────────────
     sed -i "/^${BEG}\$/,/^${END}\$/d" "$RULES"
-    sed -i 's|^## \[volume-tuning disabled\] ||' "$RULES"
-    sed -i 's|^## \[volume-tuning absent-path\] ||' "$RULES"
+    sed -i -e 's|^## \[volume-tuning disabled\] ||' \
+           -e 's|^## \[volume-tuning absent-path\] ||' "$RULES"
 
-    # ── 1. Rule families disabled outright ────────────────────────
-    #
-    # Each of these was measured against server-like activity (desktop and
-    # interactive-session noise excluded) before being cut. Percentages below
-    # are that measurement's share of total server-like audit bytes.
-    #
-    #   file_access         open() -> EACCES/EPERM. Records failed opens by
-    #                       unprivileged users. Overwhelmingly benign, and it
-    #                       spikes hard whenever a service lacks a permission.
-    #   file_creation       Same EACCES/EPERM pattern, for create-type calls.
-    #   file_modification   Same EACCES/EPERM pattern, for rename/truncate/chmod.
-    #   network_socket_created
-    #                       socket(AF_INET/AF_INET6). Fires on every outbound
-    #                       DNS lookup and HTTP client call. A socket with no
-    #                       connect() carries no detection signal on its own,
-    #                       and connect() is separately covered for both IPv4
-    #                       (a2=16) and IPv6 (a2=28), which is where the actual
-    #                       C2 / lateral-movement evidence lives.
-    local CUT_KEYS=(file_access file_creation file_modification network_socket_created)
+    if ! grep -q '^-a always,exit' "$RULES"; then
+        warn "No 'always,exit' rule found — skipping volume tuning."
+        return 0
+    fi
 
-    local k n_off=0
-    for k in "${CUT_KEYS[@]}"; do
-        sed -i -E "s|^(-a .*-k ${k})[[:space:]]*\$|## [volume-tuning disabled] \1|" "$RULES"
+    # Comment out every -a/-w line carrying a given key ("-k K" or "-F key=K").
+    _off_key() {
+        sed -i -E "s@^(-[aw] .*(-k |-F key=)${1})[[:space:]]*\$@${OFF}\1@" "$RULES"
+    }
+    # Resolve a command to its real path (exe= compares the real inode).
+    _real_cmd() {
+        local c
+        c=$(command -v -- "$1" 2>/dev/null) || return 1
+        [[ "$c" == /* && -x "$c" ]] || return 1
+        readlink -f -- "$c"
+    }
+    _first_real() {
+        local p
+        for p in "$@"; do [[ -x "$p" ]] && { readlink -f -- "$p"; return 0; }; done
+        return 1
+    }
+
+    # ── 1. Rule families cut outright ─────────────────────────────
+    #   file_access / file_creation / file_modification   EACCES/EPERM noise
+    #   network_socket_created   socket() with no connect() carries no signal
+    #   unauthedfileaccess_system   daemon EACCES on open(): rpm and Netdata
+    #                               were 95% of it. Same reasoning as
+    #                               file_access, applied to auid=unset.
+    local k
+    for k in file_access file_creation file_modification \
+             network_socket_created unauthedfileaccess_system; do
+        _off_key "$k"
     done
-    # perm_mod and delete are replaced rather than removed (see below).
-    sed -i -E 's|^(-a .*-k (perm_mod\|delete))[[:space:]]*$|## [volume-tuning disabled] \1|' "$RULES"
-    n_off=$(grep -c '^## \[volume-tuning disabled\]' "$RULES" || true)
 
-    # ── 2. Rebuild the two "right idea, wrong scope" families ─────
-    local PERM="chmod,fchmod,fchmodat,chown,fchown,fchownat,lchown"
-    PERM="${PERM},setxattr,lsetxattr,fsetxattr"
-    PERM="${PERM},removexattr,lremovexattr,fremovexattr"
-    local DEL="rmdir,unlink,unlinkat,rename,renameat,renameat2"
+    # ── 2. Families rebuilt in the managed block ──────────────────
+    # (originals commented out here, scoped versions emitted below)
+    for k in perm_mod delete namespaces docker auditlog sharedmemaccess; do
+        _off_key "$k"
+    done
+    if [[ "$FULL_CONNECT" != "true" ]]; then
+        _off_key network_connect_4
+        _off_key network_connect_6
+    fi
+    local n_off
+    n_off=$(grep -c "^## \[volume-tuning disabled\]" "$RULES" || true)
 
-    # Permission changes matter where they grant privilege or backdoor a binary.
-    # /opt is deliberately absent: agent software recursively chowns itself.
+    # ── 3. Build the managed block ────────────────────────────────
+    local PERM="-S chmod -S fchmod -S fchmodat -S chown -S fchown -S fchownat -S lchown"
+    PERM="${PERM} -S setxattr -S lsetxattr -S fsetxattr"
+    PERM="${PERM} -S removexattr -S lremovexattr -S fremovexattr"
+    local DEL="-S rmdir -S unlink -S unlinkat -S rename -S renameat -S renameat2"
+    local EXEC="-S execve -S execveat"
+    local NS="-S unshare -S setns -S pivot_root"
     local PERM_DIRS=(/etc /bin /sbin /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /boot)
-    # Deletion matters as anti-forensics (T1070) and persistence tampering,
-    # not as a record of users tidying up their own files.
     local DEL_DIRS=(/etc /bin /sbin /usr/bin /usr/sbin /boot /var/log /var/spool/cron)
+    local EXEC_DIRS=(/tmp /var/tmp /dev/shm /home /root /run/user /var/www /srv)
 
-    local BLK N_ADD=0 d a
+    # Attacker-useful binaries. Resolved per host; absent ones are skipped.
+    local LOLBIN_CMDS=(
+        bash sh dash zsh ksh mksh busybox
+        curl wget nc ncat netcat socat telnet ssh scp sftp ftp tftp
+        perl php ruby node lua
+        base64 xxd openssl gpg
+        useradd userdel usermod groupadd groupdel groupmod passwd chpasswd
+        chage gpasswd newusers visudo
+        crontab at batch sudo su pkexec
+        insmod rmmod modprobe chattr setfacl mkfifo
+        id whoami uname ssh-keygen
+        gcc cc g++ make tcpdump nmap iptables nft
+    )
+    # Binaries whose connect() is kept from any context (reverse shells).
+    local REVSHELL_CMDS=(bash sh dash zsh ksh mksh busybox nc ncat netcat socat telnet perl)
+
+    local -A SEEN=()
+    local LOLBINS=() REVSHELL=() c r p
+    for c in "${LOLBIN_CMDS[@]}"; do
+        r=$(_real_cmd "$c") || continue
+        [[ -n "${SEEN[$r]:-}" ]] && continue
+        SEEN[$r]=1; LOLBINS+=("$r")
+    done
+    # Versioned interpreters (python3.9, python3.12, php8.1...) - each is a
+    # distinct inode, so each needs its own rule.
+    for p in /usr/bin/python[0-9]* /usr/local/bin/python[0-9]* /usr/bin/php[0-9]*; do
+        [[ -f "$p" && -x "$p" ]] || continue
+        [[ "$(basename "$p")" =~ ^(python|php)[0-9.]+$ ]] || continue
+        r=$(readlink -f -- "$p")
+        [[ -n "${SEEN[$r]:-}" ]] && continue
+        SEEN[$r]=1; LOLBINS+=("$r")
+    done
+    SEEN=()
+    for c in "${REVSHELL_CMDS[@]}"; do
+        r=$(_real_cmd "$c") || continue
+        [[ -n "${SEEN[$r]:-}" ]] && continue
+        SEEN[$r]=1; REVSHELL+=("$r")
+    done
+
+    # Agent binaries for POLICY 3.
+    local NETDATA_BIN NETDATA_EBPF=() DOCKER_RT=() SPLUNKD d
+    NETDATA_BIN=$(_first_real /usr/sbin/netdata /opt/netdata/bin/netdata \
+                              /opt/netdata/usr/sbin/netdata) || NETDATA_BIN=""
+    for d in /usr/libexec/netdata/plugins.d /usr/lib/netdata/plugins.d \
+             /opt/netdata/usr/libexec/netdata/plugins.d; do
+        for p in ebpf.plugin ebpf-go.plugin; do
+            [[ -x "$d/$p" ]] && NETDATA_EBPF+=("$(readlink -f -- "$d/$p")")
+        done
+    done
+    for c in dockerd containerd; do
+        r=$(_real_cmd "$c") && DOCKER_RT+=("$r")
+    done
+    SPLUNKD=$(_first_real /opt/splunkforwarder/bin/splunkd /opt/splunk/bin/splunkd) || SPLUNKD=""
+
+    local BLK N_ADD=0 a n_site=0 line
     BLK=$(mktemp)
+    _r() { echo "$*"; N_ADD=$((N_ADD + 1)); }
     {
         echo "$BEG"
-        echo "## Curated from the pinned Neo23x0 baseline. Three kinds of change:"
-        echo "##   cut      - low signal per byte, removed entirely"
-        echo "##   narrowed - right intent, wrong scope; rebuilt against the"
-        echo "##              paths where the event actually means something"
-        echo "##   kept     - everything else, including process_creation"
-        echo "##"
-        echo "## process_creation (execve) is deliberately NOT scoped by auid."
-        echo "## Restricting it to auid>=1000 is the common advice and it is a"
-        echo "## trap: a process spawned by a network service has auid=unset, so"
-        echo "## a web shell running as www-data would execute completely"
-        echo "## unlogged. It is the largest single source of volume here and"
-        echo "## also the most valuable - pay for it, and cut elsewhere."
-        echo "##"
-        echo "## SITE SUPPRESSIONS go immediately below, before the always,exit"
-        echo "## rules - auditd is first-match, so anything placed after them is"
-        echo "## never reached. Suppressing by -F exe= is a real detection gap:"
-        echo "## whatever an attacker can invoke as that path becomes invisible."
-        echo "## Prefer fixing the noisy process. To find which exe is actually"
-        echo "## costing you, attribute whole audit events to their executable -"
-        echo "## the byte-attribution recipe is in the repository README:"
-        echo "##   https://github.com/Usku81/splunk-uf-logging-scripts"
-        echo "## Then suppress only the confirmed-benign one, e.g.:"
-        echo "##   -a never,exit -F arch=b64 -S all -F exe=/usr/bin/some-agent"
+        echo "## BUDGET PROFILE - generated $(date '+%Y-%m-%d %H:%M') by $(basename "$0")"
+        echo "## Do not edit inside this block: it is rebuilt on every run."
+        echo "## Site-specific suppressions belong in audit.site-suppressions.rules"
+        echo "## next to the script (lines starting '-a never,' are copied here)."
         echo ""
-        for d in "${PERM_DIRS[@]}"; do
-            [[ -d "$d" ]] || continue          # auditctl rejects a missing dir=
+
+        # Site suppressions first: auditd is first-match.
+        if [[ -f "$SITE_FILE" ]]; then
+            echo "## -- site suppressions (${SITE_FILE##*/}) --"
+            while IFS= read -r line; do
+                [[ "$line" =~ ^-a\ never, ]] || continue
+                _r "$line"; n_site=$((n_site + 1))
+            done < "$SITE_FILE"
+            echo ""
+        fi
+
+        echo "## -- record-type exclusions --"
+        echo "## PROCTITLE duplicates EXECVE argv on every exec (17% of bytes)."
+        _r "-a always,exclude -F msgtype=PROCTITLE"
+        echo "## CWD dropped for daemons only; kept for login sessions, where a"
+        echo "## human's relative paths need it. Kernels/auditctl that reject"
+        echo "## fields on the exclude list skip this line (-i) and keep CWD."
+        _r "-a always,exclude -F msgtype=CWD -F auid=unset"
+        echo ""
+
+        echo "## -- agent noise, exact (exe, syscall) pairs --"
+        if [[ -n "$NETDATA_BIN" ]]; then
             for a in b64 b32; do
-                echo "-a always,exit -F arch=${a} -S ${PERM} -F dir=${d} -F auid>=1000 -F auid!=unset -k perm_mod"
-                N_ADD=$((N_ADD + 1))
+                _r "-a never,exit -F arch=${a} -S msgctl -S msgget -S semctl -S semget -S shmctl -S shmget -F exe=${NETDATA_BIN}"
+            done
+        fi
+        for p in ${NETDATA_EBPF+"${NETDATA_EBPF[@]}"}; do
+            _r "-a never,exit -F arch=b64 -S bpf -F exe=${p}"
+        done
+        for p in ${DOCKER_RT+"${DOCKER_RT[@]}"}; do
+            _r "-a never,exit -F arch=b64 -S mknod -S mknodat -F exe=${p}"
+        done
+        if [[ -n "$SPLUNKD" ]]; then
+            echo "## The forwarder tailing audit.log tripped the auditlog watch on every read."
+            for a in b64 b32; do
+                _r "-a never,exit -F arch=${a} -F dir=/var/log/audit/ -F exe=${SPLUNKD}"
+            done
+        fi
+        _r "-w /var/log/audit/ -p wra -k auditlog"
+        echo ""
+
+        echo "## -- execution from writable / staging directories (any context) --"
+        echo "## Must precede the /dev/shm suppression re-added just below."
+        for d in "${EXEC_DIRS[@]}"; do
+            [[ -d "$d" ]] || continue
+            for a in b64 b32; do
+                _r "-a always,exit -F arch=${a} ${EXEC} -F dir=${d} -k process_creation"
             done
         done
+        echo "## upstream /dev/shm high-volume filter, moved below the exec rule"
+        for a in b32 b64; do
+            _r "-a never,exit -F arch=${a} -F dir=/dev/shm/ -F key=sharedmemaccess"
+        done
         echo ""
+
+        if [[ "$FULL_EXEC" != "true" ]]; then
+            echo "## -- POLICY 1: daemon executions limited to attacker-useful binaries --"
+            for p in ${LOLBINS+"${LOLBINS[@]}"}; do
+                _r "-a always,exit -F arch=b64 ${EXEC} -F exe=${p} -k process_creation"
+            done
+            echo "## everything else exec'd outside a login session (b64 only; the"
+            echo "## stock rule further down still logs all auid-set and all b32 execs)"
+            _r "-a never,exit -F arch=b64 ${EXEC} -F auid=unset"
+            echo ""
+        fi
+
+        echo "## -- perm_mod / delete: security-relevant paths only --"
+        for d in "${PERM_DIRS[@]}"; do
+            [[ -d "$d" ]] || continue
+            for a in b64 b32; do
+                _r "-a always,exit -F arch=${a} ${PERM} -F dir=${d} -F auid>=1000 -F auid!=unset -k perm_mod"
+            done
+        done
         for d in "${DEL_DIRS[@]}"; do
             [[ -d "$d" ]] || continue
             for a in b64 b32; do
-                echo "-a always,exit -F arch=${a} -S ${DEL} -F dir=${d} -F auid>=1000 -F auid!=unset -k delete"
-                N_ADD=$((N_ADD + 1))
+                _r "-a always,exit -F arch=${a} ${DEL} -F dir=${d} -F auid>=1000 -F auid!=unset -k delete"
             done
         done
+        echo ""
+
+        echo "## -- namespaces: unprivileged (userns privesc) and login sessions --"
+        echo "## runc/containerd entering container namespaces as root was 98%."
+        for a in b64 b32; do
+            _r "-a always,exit -F arch=${a} ${NS} -F uid!=0 -k namespaces"
+            _r "-a always,exit -F arch=${a} ${NS} -F auid!=unset -k namespaces"
+        done
+        echo ""
+
+        if [[ "$FULL_CONNECT" != "true" ]]; then
+            echo "## -- POLICY 2: outbound connect --"
+            for a in b64 b32; do
+                _r "-a always,exit -F arch=${a} -S connect -F a2=16 -F success=1 -F auid!=unset -k network_connect_4"
+                _r "-a always,exit -F arch=${a} -S connect -F a2=28 -F success=1 -F auid!=unset -k network_connect_6"
+            done
+            for p in ${REVSHELL+"${REVSHELL[@]}"}; do
+                _r "-a always,exit -F arch=b64 -S connect -F a2=16 -F success=1 -F exe=${p} -k network_connect_4"
+                _r "-a always,exit -F arch=b64 -S connect -F a2=28 -F success=1 -F exe=${p} -k network_connect_6"
+            done
+            echo ""
+        fi
+
+        echo "## -- container config only (data dir watch dropped) --"
+        _r "-w /etc/docker -p wa -k docker"
         echo ""
         echo "$END"
     } > "$BLK"
 
-    if ! grep -q '^-a always,exit' "$RULES"; then
-        warn "No 'always,exit' rule found — skipping volume tuning."
-        rm -f "$BLK"; return 0
-    fi
     awk -v blk="$BLK" '
         !spliced && /^-a always,exit/ {
             while ((getline l < blk) > 0) print l
@@ -334,56 +546,22 @@ tune_audit_volume() {
     rm -f "$BLK"
 
     # ── 4. Prune rules referencing paths absent on this host ──────
-    #
-    # auditctl validates the path in -F dir=, -F exe= and -w at load time and
-    # refuses the rule with:
-    #     Error sending add rule data request (No such file or directory)
-    #     There was an error in line N of /etc/audit/audit.rules
-    #
-    # The upstream ruleset ships rules for software that is not installed on a
-    # default RHEL host - Filebeat (/etc/filebeat, /usr/share/filebeat),
-    # CrowdStrike Falcon (/etc/crowdstrike, /usr/lib/crowdstrike,
-    # /opt/CrowdStrike, /var/log/crowdstrike and the falcon-sensor binary),
-    # VMware tools (/usr/bin/vmtoolsd) and the LVM lock dir (/var/lock/lvm).
-    # Each produces two error lines on every load and every auditd restart,
-    # which is noise in the logs of all 70 hosts and makes the loaded rule
-    # count disagree with the file for no reason.
-    #
-    # Deliberately generic rather than a denylist of those names: any rule
-    # whose path is missing gets the same treatment, so this keeps working as
-    # upstream adds vendors. It is re-evaluated on every run against a freshly
-    # downloaded ruleset, so installing the software and re-running restores
-    # its rules automatically.
-    #
-    # This costs no detection coverage: auditctl had already REFUSED these
-    # rules, so they were never in the kernel. Pruning only stops the error.
-    #
-    # It does however make a pre-existing upstream gap visible. Watches on
-    # files that do not exist yet - /etc/cron.allow, /etc/cron.deny,
-    # /etc/at.allow, /etc/at.deny - are exactly the ones an attacker might
-    # CREATE to control who may schedule jobs, and auditd cannot watch a path
-    # that is absent. Those events are unmonitored both before and after this
-    # change. If that matters in your environment, create the files empty with
-    # the correct ownership so the watches load, or add a rule covering
-    # creation within /etc rather than the individual filenames.
-    local PRUNED=0 line p paths keep
+    # auditctl refuses -w, -F dir= and -F exe= on a missing path, two error
+    # lines per rule on every load. Re-evaluated each run, so installing the
+    # software and re-running restores its rules. No coverage is lost: the
+    # kernel had already refused them.
+    local PRUNED=0 line keep paths
     : > "${RULES}.tmp"
     while IFS= read -r line; do
         keep=1
         if [[ "$line" == -a\ * || "$line" == -w\ * ]]; then
             paths=()
-            # -w <path>  (file/directory watch)
             [[ "$line" == -w\ * ]] && paths+=("$(printf '%s' "$line" | awk '{print $2}')")
-            # -F dir=<path> and -F exe=<path> (may both appear on one rule)
             if [[ "$line" == *" -F dir="* ]]; then p=${line#*-F dir=}; paths+=("${p%% *}"); fi
             if [[ "$line" == *" -F exe="* ]]; then p=${line#*-F exe=}; paths+=("${p%% *}"); fi
             for p in ${paths+"${paths[@]}"}; do
-                # Only absolute paths; strip any trailing slash before testing.
                 [[ "$p" == /* ]] || continue
-                if [[ ! -e "${p%/}" ]]; then
-                    keep=0
-                    break
-                fi
+                if [[ ! -e "${p%/}" ]]; then keep=0; break; fi
             done
         fi
         if (( keep )); then
@@ -394,15 +572,17 @@ tune_audit_volume() {
         fi
     done < "$RULES"
     mv "${RULES}.tmp" "$RULES"
-
     chmod 640 "$RULES"; chown root:root "$RULES"
 
-    ok "Volume tuning: cut/narrowed ${n_off} rule(s), added ${N_ADD} scoped rule(s)."
-    if (( PRUNED > 0 )); then
-        ok "  Pruned ${PRUNED} rule(s) referencing paths not present on this host."
-        log "  (Filebeat / CrowdStrike / VMware-tools style rules. Install the"
-        log "   software and re-run to restore them.)"
-    fi
+    ok "Budget profile: disabled ${n_off} stock rule(s), added ${N_ADD} managed rule(s)."
+    log "  LOLBIN exec exceptions: ${#LOLBINS[@]}   reverse-shell connect rules: ${#REVSHELL[@]}"
+    [[ -n "$NETDATA_BIN" ]] && log "  Netdata detected — IPC/eBPF suppressions added for its own binaries."
+    [[ ${#DOCKER_RT[@]} -gt 0 ]] && log "  Container runtime detected — mknod suppression added for dockerd/containerd."
+    (( n_site > 0 )) && log "  Site suppressions applied: ${n_site}"
+    [[ "$FULL_EXEC" == "true" ]]    && warn "  --full-exec: daemon executions NOT narrowed (~+35 MB/host/day)."
+    [[ "$FULL_CONNECT" == "true" ]] && warn "  --full-connect: daemon connects NOT narrowed (~+50 MB/host/day)."
+    (( PRUNED > 0 )) && log "  Pruned ${PRUNED} rule(s) referencing paths not present on this host."
+    return 0
 }
 
 if [[ "$SKIP_VOLUME_TUNING" == "true" ]]; then
@@ -600,6 +780,98 @@ for f in /var/log/secure /var/log/messages /var/log/cron; do
     fi
 done
 
+SYSLOG_SERVICE="rsyslog"   # RHEL default; STEP 4 enforces it
+
+# ═══════════════════════════════════════════════════════════════════
+# STEP 4b: Curated syslog feed for Splunk (/var/log/splunk-syslog.log)
+# ═══════════════════════════════════════════════════════════════════
+section "STEP 4b: Curated syslog feed for Splunk"
+log "Measured baseline: /var/log/messages averaged 36 MB/host/day — 68% one"
+log "Java service's stdout, 13% containerd, 13% setroubleshoot (a prose copy"
+log "of AVC denials already in audit.log). Security content was under 5%."
+
+# The local files are NOT changed: admins keep full messages/syslog on disk.
+# rsyslog writes a second, curated file and only that one is forwarded:
+#   kept:    kern.*, cron.*, anything at warning or above, and the listed
+#            security-relevant programs at every severity
+#   dropped: auth/authpriv (already collected via the auth input),
+#            setroubleshoot (duplicate of AVC), UFW per-packet lines
+#            (perimeter firewall logs already cover them), and info-level
+#            chatter from applications, containerd/dockerd and NetworkManager
+CURATED_LOG="/var/log/splunk-syslog.log"
+CURATED_CONF="/etc/rsyslog.d/48-splunk-curated.conf"
+
+curate_syslog() {
+    if [[ "$SYSLOG_SERVICE" != "rsyslog" ]]; then
+        warn "$SYSLOG_SERVICE is not rsyslog — curated feed not configured."
+        warn "  Point inputs.conf back at the full syslog file for this host."
+        return 0
+    fi
+
+    local grp_opt=""
+    getent group adm &>/dev/null && grp_opt=' fileGroup="adm"'
+
+    cat > "$CURATED_CONF" <<EOF
+# Managed by $(basename "$0") — curated feed for the Splunk forwarder.
+# Local /var/log/messages and /var/log/syslog are untouched; only
+# ${CURATED_LOG} is forwarded. Remove this file to revert.
+if ( \$syslogfacility-text != "auth" and \$syslogfacility-text != "authpriv" )
+   and not ( \$programname == ["setroubleshoot", "setroubleshootd"] )
+   and not ( \$msg contains "[UFW " )
+   and ( \$syslogfacility-text == ["kern", "cron"]
+         or \$syslogseverity <= 4
+         or \$programname == ["systemd", "systemd-logind", "sshd", "sshd-session",
+                             "sudo", "su", "useradd", "userdel", "usermod",
+                             "groupadd", "groupdel", "groupmod", "passwd",
+                             "chpasswd", "chage", "gpasswd", "auditd", "audispd",
+                             "augenrules", "rsyslogd", "polkitd", "dnf", "yum",
+                             "rpm", "apt", "dpkg", "firewalld", "ufw", "sysmon",
+                             "atd", "crond", "CROND", "CRON", "anacron", "kernel"] )
+then {
+    action(type="omfile" file="${CURATED_LOG}" template="RSYSLOG_FileFormat"
+           fileCreateMode="0640"${grp_opt})
+}
+EOF
+    chmod 644 "$CURATED_CONF"
+
+    # Validate before restarting: a syntax error would stop ALL local logging.
+    if ! rsyslogd -N1 >/dev/null 2>&1; then
+        mv "$CURATED_CONF" "${CURATED_CONF}.invalid"
+        err "rsyslog rejected the curated config — moved to ${CURATED_CONF}.invalid."
+        err "  Run 'rsyslogd -N1' to see why. Local logging is unaffected."
+        return 0
+    fi
+    systemctl restart rsyslog
+    ok "Curated feed configured: ${CURATED_CONF} -> ${CURATED_LOG}"
+
+    # Rotation. The UF follows rotations by CRC, so daily + delaycompress is safe.
+    local owner="root"
+    id syslog &>/dev/null && owner="syslog"
+    cat > /etc/logrotate.d/splunk-syslog <<EOF
+# Managed by $(basename "$0")
+${CURATED_LOG} {
+    daily
+    rotate 7
+    maxsize 200M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 ${owner} adm
+    postrotate
+        /usr/bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+    chmod 644 /etc/logrotate.d/splunk-syslog
+    ok "Rotation configured: /etc/logrotate.d/splunk-syslog (daily, 7 kept)."
+
+    # Self-test so the validation step has a file to check.
+    logger -p daemon.warning -t splunk-curation "curated syslog feed self-test (safe to ignore)"
+    sleep 1
+}
+curate_syslog
+
 # ═══════════════════════════════════════════════════════════════════
 # STEP 5: Verify SELinux is Enforcing
 # ═══════════════════════════════════════════════════════════════════
@@ -620,14 +892,13 @@ else
     warn "AVC events will NOT appear. This reduces detection coverage significantly."
 fi
 
-# Enable setroubleshoot for human-readable AVC messages (optional)
-if $PKG_MGR list installed setroubleshoot-server &>/dev/null 2>&1; then
-    ok "setroubleshoot-server already installed (human-readable AVC messages available)."
-else
-    log "Installing setroubleshoot-server for human-readable AVC messages..."
-    $PKG_MGR install -y setroubleshoot-server 2>/dev/null && \
-        ok "setroubleshoot-server installed." || \
-        warn "setroubleshoot-server install failed (non-critical)."
+# setroubleshoot is NOT installed by the budget profile. It re-writes every
+# AVC denial as multi-line prose into /var/log/messages — measured at 13% of
+# messages volume (~50 MB/day across 11 hosts) — while the AVC record itself
+# is already collected from audit.log. The curated syslog feed excludes it,
+# so an existing install costs no license; it is left in place for local use.
+if rpm -q setroubleshoot-server &>/dev/null; then
+    log "setroubleshoot-server present — kept locally, excluded from the Splunk feed."
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -759,7 +1030,8 @@ log "Source: Microsoft MSTIC — MITRE ATT&CK coverage (T1105, T1071, T1059)"
 log "Events appear in /var/log/messages on RHEL/CentOS"
 
 if [[ "$SKIP_SYSMON" == "true" ]]; then
-    warn "Sysmon for Linux skipped (--skip-sysmon)."
+    log "Sysmon for Linux not installed (budget profile default; --with-sysmon to enable)."
+    log "  Its process-create events would duplicate auditd process_creation."
 else
     if command -v sysmon &>/dev/null; then
         ok "Sysmon for Linux already installed."
@@ -880,9 +1152,24 @@ if [[ "$SKIP_VOLUME_TUNING" != "true" ]]; then
     check "socket() noise rule disabled"   "[[ \$(auditctl -l | grep -c 'key=network_socket_created$') -eq 0 ]]"
     check "raw-socket rule KEPT (T1040)"   "auditctl -l | grep -q 'key=raw_network_socket_created'"
     check "delete narrowed to key paths"   "auditctl -l | grep -q 'dir=/var/log.*delete'"
-    check "process_creation kept system-wide" "auditctl -l | grep -q 'execve.*process_creation'"
+    check "process_creation rule loaded"     "auditctl -l | grep -q 'execve.*process_creation'"
+    check "PROCTITLE records excluded"       "auditctl -l | grep -q 'msgtype=PROCTITLE'"
+    check "/var/lib/docker data watch gone"  "[[ \$(auditctl -l | grep -c '/var/lib/docker') -eq 0 ]]"
+    check "exec from /tmp still logged"      "auditctl -l | grep -q 'dir=/tmp .*process_creation'"
+    check "unauthedfileaccess_system cut"    "[[ \$(auditctl -l | grep -c 'key=unauthedfileaccess_system') -eq 0 ]]"
+    if [[ "$FULL_EXEC" != "true" ]]; then
+        check "daemon execs narrowed (policy 1)" "auditctl -l | grep -qE 'never,exit.*execve.*auid=(-1|unset|4294967295)'"
+        check "shell exec exception present"     "auditctl -l | grep -qE 'exe=/(usr/)?bin/(bash|dash) .*process_creation'"
+    fi
+    if [[ "$FULL_CONNECT" != "true" ]]; then
+        check "connect scoped (policy 2)"        "[[ \$(auditctl -l | grep 'key=network_connect_4' | grep -vcE 'auid!=|exe=') -eq 0 ]]"
+    fi
 fi
 check "audit.log exists"                   "[[ -f /var/log/audit/audit.log ]]"
+check "curated rsyslog config valid"       "[[ -f $CURATED_CONF ]] && rsyslogd -N1"
+check "curated feed file exists"           "[[ -f $CURATED_LOG ]]"
+check "curated feed received self-test"    "grep -q 'curated syslog feed self-test' $CURATED_LOG"
+check "curated feed rotation configured"   "[[ -f /etc/logrotate.d/splunk-syslog ]]"
 check "rsyslog running"                    "systemctl is-active rsyslog"
 check "/var/log/secure exists"             "[[ -f /var/log/secure ]]"
 check "/var/log/messages exists"           "[[ -f /var/log/messages ]]"
@@ -906,14 +1193,11 @@ echo ""
 log "Full log saved to: $LOG_FILE"
 echo ""
 echo -e "${YELLOW}  Next steps:${NC}"
-echo -e "${YELLOW}  1. Deploy RHEL/CentOS inputs.conf to: \$SPLUNK_HOME/etc/system/local/${NC}"
-echo -e "${YELLOW}  2. Deploy outputs.conf to:            \$SPLUNK_HOME/etc/system/local/${NC}"
-echo -e "${YELLOW}  3. Restart Splunk UF:                 \$SPLUNK_HOME/bin/splunk restart${NC}"
-echo -e "${YELLOW}  4. If UF not running as root, ensure $SPLUNK_USER is in adm/wheel group${NC}"
-echo -e "${YELLOW}  5. Key log paths for inputs.conf:${NC}"
-echo -e "${YELLOW}       /var/log/secure     (SSH/sudo/PAM — NOT auth.log)${NC}"
-echo -e "${YELLOW}       /var/log/messages   (syslog — NOT /var/log/syslog)${NC}"
-echo -e "${YELLOW}       /var/log/audit/audit.log${NC}"
-echo -e "${YELLOW}       /var/log/cron${NC}"
-echo -e "${YELLOW}       /var/log/dnf.log or /var/log/yum.log${NC}"
+echo -e "${YELLOW}  1. Deploy the budget RHEL/CentOS inputs.conf to: \$SPLUNK_HOME/etc/system/local/${NC}"
+echo -e "${YELLOW}  2. Deploy outputs.conf to:                       \$SPLUNK_HOME/etc/system/local/${NC}"
+echo -e "${YELLOW}  3. Restart Splunk UF:                            \$SPLUNK_HOME/bin/splunk restart${NC}"
+echo -e "${YELLOW}  4. If UF not running as root, ensure $SPLUNK_USER is in adm group${NC}"
+echo -e "${YELLOW}  5. Forwarded paths: audit.log, secure, splunk-syslog.log, dnf logs${NC}"
+echo -e "${YELLOW}     (messages and cron are no longer forwarded — curated feed replaces them)${NC}"
+echo -e "${YELLOW}  6. After 24h, check this host's MB/day in license_usage.log (target <62 MB)${NC}"
 echo ""
